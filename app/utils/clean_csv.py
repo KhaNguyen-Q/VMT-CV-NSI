@@ -3,6 +3,11 @@ import sys
 import numpy as np
 import pandas as pd
 
+# Allow `python clean_csv.py` from app/utils (or elsewhere) to import windows.*
+_APP_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _APP_DIR not in sys.path:
+    sys.path.insert(0, _APP_DIR)
+
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QGroupBox
@@ -10,14 +15,15 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt
 import pyqtgraph as pg
 
-# Configure global pyqtgraph appearance
+from windows.graph_viewbox import GraphViewBox
+
+# Match main-app plot look; keep antialias off for large oscilloscope traces
 pg.setConfigOption('background', '#1e1e1e')
 pg.setConfigOption('foreground', '#dcdcdc')
-pg.setConfigOptions(antialias=True)
+pg.setConfigOptions(antialias=False)
 
 
 class Plot_csv(QWidget):
-
 
     def __init__(self, dataframe, title="Cleaned oscilloscope data"):
         super().__init__()
@@ -27,48 +33,55 @@ class Plot_csv(QWidget):
 
         layout = QVBoxLayout(self)
 
-        # 1. Main Plot Widget
-        self.plot_widget = pg.PlotWidget()
-        self.plot_widget.setLabel('bottom', 'Time', units='s')
-        self.plot_widget.setLabel('left', 'Voltage', units='V')
-        self.plot_widget.setTitle(title)
-        self.plot_widget.showGrid(x=True, y=True, alpha=0.35)
-
-        # Plot data line
-        self.curve = self.plot_widget.plot(
-            self.df["Second"].values,
-            self.df["Volt"].values,
-            pen=pg.mkPen(color="#03fcc2", width=1.5),
-            name="Voltage"
+        # Same interactive graph pattern as AppWindow.create_graph_layout
+        self.graph_layout = pg.GraphicsLayoutWidget()
+        self.plot = self.graph_layout.addPlot(
+            title=title,
+            viewBox=GraphViewBox(),
         )
-        layout.addWidget(self.plot_widget)
+        self.graph_layout.setToolTip(
+            "Wheel: zoom both axes | Ctrl+wheel/right-drag: X axis | "
+            "Shift+wheel/right-drag: Y axis | Left-drag: pan"
+        )
+        self.plot.showGrid(x=True, y=True)
+        self.plot.setLabel("bottom", "Time", units="s")
+        self.plot.setLabel("left", "Voltage", units="V")
 
-        # 2. Interactive Crosshairs
-        self.v_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('#777', style=Qt.DashLine))
-        self.h_line = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen('#777', style=Qt.DashLine))
-        self.plot_widget.addItem(self.v_line, ignoreBounds=True)
-        self.plot_widget.addItem(self.h_line, ignoreBounds=True)
+        self.curve = self.plot.plot(
+            pen=pg.mkPen(color="#03fcc2", width=1.5),
+            name="Voltage",
+        )
+        self.curve.setDownsampling(auto=True, method="subsample")
+        self.curve.setClipToView(True)
+        self.curve.setData(
+            x=self.df["Second"].values,
+            y=self.df["Volt"].values,
+        )
+        layout.addWidget(self.graph_layout)
 
-        # 3. Mouse Coordinate Readout
+        # Crosshairs
+        self.v_line = pg.InfiniteLine(
+            angle=90, movable=False, pen=pg.mkPen("#777", style=Qt.DashLine)
+        )
+        self.h_line = pg.InfiniteLine(
+            angle=0, movable=False, pen=pg.mkPen("#777", style=Qt.DashLine)
+        )
+        self.plot.addItem(self.v_line, ignoreBounds=True)
+        self.plot.addItem(self.h_line, ignoreBounds=True)
+
         self.coordinates = QLabel("Move the cursor over the plot to inspect a point")
         self.coordinates.setStyleSheet("font-size: 13px; font-weight: bold; padding: 4px;")
         layout.addWidget(self.coordinates)
 
-        # 4. Manual Axis Adjustment Panel
         layout.addWidget(self._create_axis_control_panel())
 
-        # Connect signals
-        self.plot_widget.scene().sigMouseMoved.connect(self._show_coordinates)
-
-
-
+        self.plot.scene().sigMouseMoved.connect(self._show_coordinates)
 
     def _create_axis_control_panel(self):
         """Creates interactive controls to adjust X and Y axis bounds manually."""
         panel = QGroupBox("Axis Limits Control")
         panel_layout = QHBoxLayout(panel)
 
-        # Time (X) Inputs
         panel_layout.addWidget(QLabel("Time Min:"))
         self.x_min_input = QLineEdit()
         panel_layout.addWidget(self.x_min_input)
@@ -77,7 +90,6 @@ class Plot_csv(QWidget):
         self.x_max_input = QLineEdit()
         panel_layout.addWidget(self.x_max_input)
 
-        # Voltage (Y) Inputs
         panel_layout.addWidget(QLabel("Volt Min:"))
         self.y_min_input = QLineEdit()
         panel_layout.addWidget(self.y_min_input)
@@ -86,7 +98,6 @@ class Plot_csv(QWidget):
         self.y_max_input = QLineEdit()
         panel_layout.addWidget(self.y_max_input)
 
-        # Action Buttons
         apply_btn = QPushButton("Apply Bounds")
         apply_btn.clicked.connect(self._apply_axis_bounds)
         panel_layout.addWidget(apply_btn)
@@ -99,8 +110,8 @@ class Plot_csv(QWidget):
 
     def _show_coordinates(self, pos):
         """Update crosshair location and coordinate text on mouse hover."""
-        mouse_point = self.plot_widget.plotItem.vb.mapSceneToView(pos)
-        if self.plot_widget.plotItem.sceneBoundingRect().contains(pos):
+        if self.plot.sceneBoundingRect().contains(pos):
+            mouse_point = self.plot.vb.mapSceneToView(pos)
             x, y = mouse_point.x(), mouse_point.y()
             self.v_line.setPos(x)
             self.h_line.setPos(y)
@@ -112,18 +123,18 @@ class Plot_csv(QWidget):
             if self.x_min_input.text() and self.x_max_input.text():
                 x_min = float(self.x_min_input.text())
                 x_max = float(self.x_max_input.text())
-                self.plot_widget.setXRange(x_min, x_max, padding=0)
+                self.plot.setXRange(x_min, x_max, padding=0)
 
             if self.y_min_input.text() and self.y_max_input.text():
                 y_min = float(self.y_min_input.text())
                 y_max = float(self.y_max_input.text())
-                self.plot_widget.setYRange(y_min, y_max, padding=0)
+                self.plot.setYRange(y_min, y_max, padding=0)
         except ValueError:
             self.coordinates.setText("Error: Enter valid numeric values for bounds.")
 
     def _reset_view(self):
         """Reset plot view back to full dataset extent."""
-        self.plot_widget.enableAutoRange()
+        self.plot.enableAutoRange()
         self.x_min_input.clear()
         self.x_max_input.clear()
         self.y_min_input.clear()
@@ -143,9 +154,85 @@ def show_interactive_plot(dataframe, title="Cleaned oscilloscope data"):
         return window
 
 
-def clean_csv(filename, out_path=None, show_plot=False):
+def jump_mask(voltages, dv_max=0.75):
+    """Keep samples whose step from the previous point stays within dv_max volts."""
+    v = np.asarray(voltages, dtype=float)
+    if len(v) == 0:
+        return np.array([], dtype=bool)
+    dv = np.abs(np.diff(v, prepend=v[0]))
+    # First sample has no predecessor; always keep it.
+    dv[0] = 0.0
+    return dv <= dv_max
+
+
+def hampel_mask(voltages, window=101, n_sigmas=3.0):
+    """
+    Keep samples within n_sigmas of the rolling median (Hampel / MAD filter).
+    window should be odd so the window is centered on each sample.
+    """
+    if window % 2 == 0:
+        window += 1
+    s = pd.Series(np.asarray(voltages, dtype=float))
+    if len(s) == 0:
+        return np.array([], dtype=bool)
+
+    min_periods = max(3, window // 2)
+    med = s.rolling(window, center=True, min_periods=min_periods).median()
+    abs_dev = (s - med).abs()
+    mad = abs_dev.rolling(window, center=True, min_periods=min_periods).median()
+    # 1.4826 scales MAD to roughly match a normal-distribution sigma.
+    # MAD == 0 on flat/quantized stretches: keep those points (no local spread).
+    sigma = 1.4826 * mad
+    keep = (sigma == 0) | (abs_dev <= n_sigmas * sigma)
+    # If the rolling window is undefined at the edges, fall back to keeping.
+    return keep.fillna(True).to_numpy()
+
+
+def remove_voltage_outliers(df, dv_max=0.75, hampel_window=101, hampel_n_sigmas=3.0):
+    """
+    Drop sparse invalid floats that survive numeric coerce + voltage bounds
+    (e.g. near-zero spikes from corrupted SDS CSV rows).
+    Applies a neighbor jump filter, then a Hampel (rolling MAD) filter.
+    """
+    before = len(df)
+    if before == 0:
+        return df
+
+    keep_jump = jump_mask(df["Volt"].values, dv_max=dv_max)
+    df = df.loc[keep_jump].reset_index(drop=True)
+    after_jump = len(df)
+
+    keep_hampel = hampel_mask(
+        df["Volt"].values,
+        window=hampel_window,
+        n_sigmas=hampel_n_sigmas,
+    )
+    df = df.loc[keep_hampel].reset_index(drop=True)
+    after_hampel = len(df)
+
+    print(
+        f"Outlier filter: {before} -> {after_jump} after jump "
+        f"(dropped {before - after_jump}), "
+        f"-> {after_hampel} after Hampel "
+        f"(dropped {after_jump - after_hampel})"
+    )
+    return df
+
+
+def clean_csv(
+    filename,
+    out_path=None,
+    show_plot=False,
+    outlier_filter=True,
+    dv_max=0.75,
+    hampel_window=101,
+    hampel_n_sigmas=3.0,
+):
         """
         Read CSV, set time column bounds, drop invalid rows, and write cleaned CSV.
+
+        After numeric coerce and user bounds, optionally removes statistical
+        outliers via neighbor jump + Hampel (MAD) filters.
         """
         if not os.path.exists(filename):
             raise FileNotFoundError(f"File {filename} not found")
@@ -153,7 +240,7 @@ def clean_csv(filename, out_path=None, show_plot=False):
         # 1. Read CSV dynamically finding numeric data (skipping oscilloscope header metadata)
         try:
             df = pd.read_csv(filename, usecols=[0, 1], names=["Second", "Volt"], dtype=str, header=None, on_bad_lines='skip')
-        
+
 
         except Exception as e:
             raise ValueError(f"Failed to parse oscilloscope CSV: {e}")
@@ -178,9 +265,18 @@ def clean_csv(filename, out_path=None, show_plot=False):
 
         df = df[(df["Second"] >= time_lower_bound) & (df["Second"] <= time_upper_bound)]
 
-        # 5. Deduplicate timestamps and sort
+        # 5. Deduplicate timestamps and sort (required before jump / rolling filters)
         df = df.sort_values("Second").drop_duplicates(subset="Second")
         df = df.reset_index(drop=True)
+
+        # 6. Statistical outlier removal for corrupt-but-numeric spikes
+        if outlier_filter and len(df) > 0:
+            df = remove_voltage_outliers(
+                df,
+                dv_max=dv_max,
+                hampel_window=hampel_window,
+                hampel_n_sigmas=hampel_n_sigmas,
+            )
 
         print(f"Rows in cleaned dataframe: {len(df)}")
 
@@ -199,7 +295,8 @@ def clean_csv(filename, out_path=None, show_plot=False):
 
 
 if __name__ == "__main__":
-        # Example usage
-        input_file = r"C:\Users\Ben\Desktop\VMT\VMT-CV-NSI\data\csv\OscilliscopeCSV(in).csv"
-        output_file = r"C:\Users\Ben\Desktop\VMT\VMT-CV-NSI\data\csv\OscilliscopeCSV(out).csv"
+        # Paths are relative to the repo root
+        _repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        input_file = os.path.join(_repo_root, "data", "csv", "OscilliscopeCSV(in).csv")
+        output_file = os.path.join(_repo_root, "data", "csv", "OscilliscopeCSV(out).csv")
         clean_csv(input_file, output_file, show_plot=True)

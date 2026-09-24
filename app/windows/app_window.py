@@ -23,6 +23,7 @@ from scipy.optimize import curve_fit
 from processing.video_thread import VideoThread
 from windows.hsv_slider import HSVSlider
 from windows.analyze_widget import AnalyzeWidget
+from windows.graph_viewbox import GraphViewBox
 from utils.utils import (
     underdamped_harmonic_oscillator,
     simple_harmonic_oscillator,
@@ -49,25 +50,6 @@ from utils.contansts import (
 )
 
 project_root = get_project_root(os.path.dirname(os.path.abspath(__file__)))
-
-
-class GraphViewBox(pg.ViewBox):
-    def _axis_from_modifiers(self, modifiers):
-        if modifiers & Qt.ControlModifier:
-            return 0
-        if modifiers & Qt.ShiftModifier:
-            return 1
-        return None
-
-    def wheelEvent(self, event, axis=None):
-        if axis is None:
-            axis = self._axis_from_modifiers(event.modifiers())
-        super().wheelEvent(event, axis=axis)
-
-    def mouseDragEvent(self, event, axis=None):
-        if axis is None and event.button() == Qt.RightButton:
-            axis = self._axis_from_modifiers(event.modifiers())
-        super().mouseDragEvent(event, axis=axis)
 
 
 class AppWindow(QWidget):
