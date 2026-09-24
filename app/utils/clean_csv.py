@@ -3,6 +3,15 @@ import sys
 import numpy as np
 import pandas as pd
 
+"""
+This script is used to clean the oscilloscope CSV file.
+It is used to remove the outliers and the noise from the CSV file.
+It is also used to plot the CSV file.
+It is also used to export the CSV file as a PNG image.
+Last updated: 2026-09-24
+Author: Ben
+"""
+
 # Allow `python clean_csv.py` from app/utils (or elsewhere) to import windows.*
 _APP_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _APP_DIR not in sys.path:
@@ -10,26 +19,65 @@ if _APP_DIR not in sys.path:
 
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QLineEdit, QPushButton, QGroupBox
+    QLabel, QLineEdit, QPushButton, QGroupBox,
+    QFileDialog, QMessageBox,
 )
 from PyQt5.QtCore import Qt
 import pyqtgraph as pg
 
 from windows.graph_viewbox import GraphViewBox
+from plot_export import export_voltage_vs_time
 
 # Match main-app plot look; keep antialias off for large oscilloscope traces
 pg.setConfigOption('background', '#1e1e1e')
 pg.setConfigOption('foreground', '#dcdcdc')
 pg.setConfigOptions(antialias=False)
 
+_OVERLAY_COLORS = [
+    "#ff7f50",  # coral
+    "#ffa500",  # orange
+    "#da70d6",  # orchid
+    "#87ceeb",  # sky blue
+    "#98fb98",  # pale green
+    "#f0e68c",  # khaki
+]
+
+
+def load_voltage_csv(filename):
+    """
+    Lightweight load of a Second,Volt CSV (already cleaned preferred).
+    Does not apply voltage/time prompts or outlier filters.
+    """
+    if not os.path.exists(filename):
+        raise FileNotFoundError(f"File {filename} not found")
+    df = pd.read_csv(
+        filename,
+        usecols=[0, 1],
+        names=["Second", "Volt"],
+        dtype=str,
+        header=None,
+        on_bad_lines="skip",
+    )
+    df["Second"] = pd.to_numeric(df["Second"], errors="coerce")
+    df["Volt"] = pd.to_numeric(df["Volt"], errors="coerce")
+    df = df.dropna(subset=["Second", "Volt"])
+    df = df[np.isfinite(df["Second"]) & np.isfinite(df["Volt"])]
+    df = df.sort_values("Second").drop_duplicates(subset="Second").reset_index(drop=True)
+    if len(df) == 0:
+        raise ValueError("CSV has no numeric Second/Volt rows")
+    return df
+
 
 class Plot_csv(QWidget):
 
-    def __init__(self, dataframe, title="Cleaned oscilloscope data"):
+    def __init__(self, dataframe, title="Cleaned oscilloscope data", primary_name=None):
         super().__init__()
         self.setWindowTitle(title)
         self.resize(1100, 700)
-        self.df = dataframe
+        self._title = title
+        self._overlay_color_i = 0
+        # Each entry: {name, df, curve, is_primary}
+        self.series = []
 
         layout = QVBoxLayout(self)
 
@@ -44,19 +92,12 @@ class Plot_csv(QWidget):
             "Shift+wheel/right-drag: Y axis | Left-drag: pan"
         )
         self.plot.showGrid(x=True, y=True)
+        self.plot.addLegend()
         self.plot.setLabel("bottom", "Time", units="s")
         self.plot.setLabel("left", "Voltage", units="V")
 
-        self.curve = self.plot.plot(
-            pen=pg.mkPen(color="#03fcc2", width=1.5),
-            name="Voltage",
-        )
-        self.curve.setDownsampling(auto=True, method="subsample")
-        self.curve.setClipToView(True)
-        self.curve.setData(
-            x=self.df["Second"].values,
-            y=self.df["Volt"].values,
-        )
+        name = primary_name or "Primary"
+        self._add_series(dataframe, name=name, color="#03fcc2", is_primary=True)
         layout.addWidget(self.graph_layout)
 
         # Crosshairs
@@ -73,9 +114,50 @@ class Plot_csv(QWidget):
         self.coordinates.setStyleSheet("font-size: 13px; font-weight: bold; padding: 4px;")
         layout.addWidget(self.coordinates)
 
+        layout.addWidget(self._create_file_toolbar())
         layout.addWidget(self._create_axis_control_panel())
 
         self.plot.scene().sigMouseMoved.connect(self._show_coordinates)
+
+    def _add_series(self, df, name, color, is_primary=False):
+        curve = self.plot.plot(
+            pen=pg.mkPen(color=color, width=1.5),
+            name=name,
+        )
+        curve.setDownsampling(auto=True, method="subsample")
+        curve.setClipToView(True)
+        curve.setData(x=df["Second"].values, y=df["Volt"].values)
+        self.series.append(
+            {"name": name, "df": df, "curve": curve, "is_primary": is_primary}
+        )
+        return curve
+
+    def _create_file_toolbar(self):
+        panel = QGroupBox("Files")
+        row = QHBoxLayout(panel)
+
+        import_btn = QPushButton("Import CSV…")
+        import_btn.setToolTip("Overlay another Second,Volt CSV on this plot")
+        import_btn.clicked.connect(self._import_csv)
+        row.addWidget(import_btn)
+
+        clear_btn = QPushButton("Clear overlays")
+        clear_btn.setToolTip("Remove imported overlays; keep the primary series")
+        clear_btn.clicked.connect(self._clear_overlays)
+        row.addWidget(clear_btn)
+
+        export_csv_btn = QPushButton("Export CSV…")
+        export_csv_btn.setToolTip("Save loaded series as CSV (primary + overlays)")
+        export_csv_btn.clicked.connect(self._export_csv)
+        row.addWidget(export_csv_btn)
+
+        export_png_btn = QPushButton("Export image…")
+        export_png_btn.setToolTip("Save Voltage vs Time PNG (all series)")
+        export_png_btn.clicked.connect(self._export_image)
+        row.addWidget(export_png_btn)
+
+        row.addStretch(1)
+        return panel
 
     def _create_axis_control_panel(self):
         """Creates interactive controls to adjust X and Y axis bounds manually."""
@@ -140,14 +222,126 @@ class Plot_csv(QWidget):
         self.y_min_input.clear()
         self.y_max_input.clear()
 
+    def _import_csv(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import voltage CSV",
+            "",
+            "CSV files (*.csv);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            df = load_voltage_csv(path)
+        except Exception as exc:
+            QMessageBox.warning(self, "Import CSV", f"Failed to load CSV:\n{exc}")
+            return
 
-def show_interactive_plot(dataframe, title="Cleaned oscilloscope data"):
+        name = os.path.splitext(os.path.basename(path))[0]
+        # Avoid duplicate legend names
+        existing = {s["name"] for s in self.series}
+        base = name
+        n = 2
+        while name in existing:
+            name = f"{base} ({n})"
+            n += 1
+
+        color = _OVERLAY_COLORS[self._overlay_color_i % len(_OVERLAY_COLORS)]
+        self._overlay_color_i += 1
+        self._add_series(df, name=name, color=color, is_primary=False)
+        self.plot.enableAutoRange()
+        self.coordinates.setText(f"Imported {name}: {len(df)} points")
+
+    def _clear_overlays(self):
+        kept = []
+        for entry in self.series:
+            if entry["is_primary"]:
+                kept.append(entry)
+            else:
+                self.plot.removeItem(entry["curve"])
+        self.series = kept
+        self._overlay_color_i = 0
+        self.plot.enableAutoRange()
+        self.coordinates.setText("Overlays cleared")
+
+    def _export_csv(self):
+        if not self.series:
+            QMessageBox.warning(self, "Export CSV", "No series to export.")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export CSV",
+            "voltage_export.csv",
+            "CSV files (*.csv);;All files (*)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+
+        written = []
+        root, ext = os.path.splitext(path)
+        for i, entry in enumerate(self.series):
+            if i == 0:
+                out = path
+            else:
+                safe = "".join(
+                    c if c.isalnum() or c in ("-", "_") else "_"
+                    for c in entry["name"]
+                )
+                out = f"{root}_{safe}{ext or '.csv'}"
+            entry["df"].to_csv(out, index=False)
+            written.append(out)
+
+        QMessageBox.information(
+            self,
+            "Export CSV",
+            "Wrote:\n" + "\n".join(written),
+        )
+
+    def _export_image(self):
+        if not self.series:
+            QMessageBox.warning(self, "Export image", "No series to export.")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export image",
+            "voltage_vs_time.png",
+            "PNG images (*.png);;All files (*)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".png"):
+            path += ".png"
+
+        series_list = [
+            {
+                "name": entry["name"],
+                "times_s": entry["df"]["Second"].values,
+                "volts": entry["df"]["Volt"].values,
+            }
+            for entry in self.series
+        ]
+        try:
+            export_voltage_vs_time(path, series_list, title=self._title)
+        except Exception as exc:
+            QMessageBox.warning(self, "Export image", f"Failed to export:\n{exc}")
+            return
+        QMessageBox.information(self, "Export image", f"Saved:\n{path}")
+
+
+def show_interactive_plot(dataframe, title="Cleaned oscilloscope data", primary_name=None):
         """Display a cleaned dataframe in a pannable and zoomable PyQtGraph window."""
         app = QApplication.instance()
         owns_app = app is None
         if owns_app:
             app = QApplication(sys.argv)
-        window = Plot_csv(dataframe, title=title)
+        if primary_name is None:
+            # Prefer a short name from the window title when available
+            primary_name = title.split(":", 1)[-1].strip() if ":" in title else "Primary"
+        window = Plot_csv(dataframe, title=title, primary_name=primary_name)
         window.show()
         if owns_app:
             app.exec_()

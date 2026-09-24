@@ -183,3 +183,74 @@ def export_peak_to_peak_plot(
     fig.savefig(path, dpi=dpi)
     plt.close(fig)
     return path
+
+
+def _downsample_xy(t, y, max_points=150_000):
+    """Stride-subsample long traces so matplotlib export stays responsive."""
+    t = np.asarray(t, dtype=float)
+    y = np.asarray(y, dtype=float)
+    n = t.size
+    if n <= max_points or max_points < 2:
+        return t, y
+    step = int(np.ceil(n / max_points))
+    return t[::step], y[::step]
+
+
+def export_voltage_vs_time(
+    path,
+    series_list,
+    *,
+    title="Voltage vs Time",
+    xlabel="Time (s)",
+    ylabel="Voltage (V)",
+    figsize=(12, 5),
+    pad_frac=0.12,
+    dpi=150,
+    max_points_per_series=150_000,
+):
+    """
+    Save a Voltage vs Time PNG for one or more (name, times_s, volts) series.
+    series_list items: dict with keys name, times_s, volts (arrays).
+    Returns the written path.
+    """
+    if not series_list:
+        raise ValueError("No series to plot")
+
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    all_t = []
+    all_y = []
+    for item in series_list:
+        name = item.get("name") or "series"
+        t, y = _downsample_xy(
+            item["times_s"],
+            item["volts"],
+            max_points=max_points_per_series,
+        )
+        if t.size == 0:
+            continue
+        ax.plot(t, y, label=name, linewidth=1.2)
+        all_t.append(t)
+        all_y.append(y)
+
+    if not all_t:
+        plt.close(fig)
+        raise ValueError("No data to plot")
+
+    t_cat = np.concatenate(all_t)
+    y_cat = np.concatenate(all_y)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True)
+    t_lo, t_hi = padded_limits(t_cat, pad_frac=pad_frac * 0.5, min_span=1e-3)
+    y_lo, y_hi = padded_limits(y_cat, pad_frac=pad_frac)
+    ax.set_xlim(t_lo, t_hi)
+    ax.set_ylim(y_lo, y_hi)
+    ax.legend(loc="best")
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=dpi)
+    plt.close(fig)
+    return path
