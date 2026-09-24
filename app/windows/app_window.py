@@ -51,6 +51,25 @@ from utils.contansts import (
 project_root = get_project_root(os.path.dirname(os.path.abspath(__file__)))
 
 
+class GraphViewBox(pg.ViewBox):
+    def _axis_from_modifiers(self, modifiers):
+        if modifiers & Qt.ControlModifier:
+            return 0
+        if modifiers & Qt.ShiftModifier:
+            return 1
+        return None
+
+    def wheelEvent(self, event, axis=None):
+        if axis is None:
+            axis = self._axis_from_modifiers(event.modifiers())
+        super().wheelEvent(event, axis=axis)
+
+    def mouseDragEvent(self, event, axis=None):
+        if axis is None and event.button() == Qt.RightButton:
+            axis = self._axis_from_modifiers(event.modifiers())
+        super().mouseDragEvent(event, axis=axis)
+
+
 class AppWindow(QWidget):
     PLOT_UPDATE_EVERY = 10
 
@@ -158,7 +177,14 @@ class AppWindow(QWidget):
 
     def create_graph_layout(self):
         self.graph_layout = pg.GraphicsLayoutWidget()
-        self.plot = self.graph_layout.addPlot(title="Position vs time")
+        self.plot = self.graph_layout.addPlot(
+            title="Position vs time",
+            viewBox=GraphViewBox(),
+        )
+        self.graph_layout.setToolTip(
+            "Wheel: zoom both axes | Ctrl+wheel/right-drag: X axis | "
+            "Shift+wheel/right-drag: Y axis | Left-drag: pan"
+        )
         self.plot.showGrid(x=True, y=True)
         self.plot.addLegend()
         self.plot.setLabel("left", "Position (pixels)")
