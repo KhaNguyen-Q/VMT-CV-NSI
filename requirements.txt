@@ -16,3 +16,4 @@ kiwisolver>=1.4
 pyparsing>=3.0
 six>=1.16
 pandas
+chardet

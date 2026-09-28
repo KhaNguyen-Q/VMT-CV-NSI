@@ -2,6 +2,7 @@ import os
 import sys
 import numpy as np
 import pandas as pd
+import chardet
 
 """
 This script is used to clean the oscilloscope CSV file.
@@ -382,7 +383,7 @@ def hampel_mask(voltages, window=101, n_sigmas=3.0):
     return keep.fillna(True).to_numpy()
 
 
-def remove_voltage_outliers(df, dv_max=0.75, hampel_window=101, hampel_n_sigmas=3.0):
+def remove_voltage_outliers(df, dv_max=0.75, hampel_window=101, hampel_n_sigmas=4.0):
     """
     Drop sparse invalid floats that survive numeric coerce + voltage bounds
     (e.g. near-zero spikes from corrupted SDS CSV rows).
@@ -433,7 +434,15 @@ def clean_csv(
 
         # 1. Read CSV dynamically finding numeric data (skipping oscilloscope header metadata)
         try:
-            df = pd.read_csv(filename, usecols=[0, 1], names=["Second", "Volt"], dtype=str, header=None, on_bad_lines='skip')
+            # Detect encoding from a sample of the file
+            with open(filename, "rb") as f:
+                raw_data = f.read(50000)  # read first 50KB
+                result = chardet.detect(raw_data)
+                encoding_detected = result["encoding"]
+                print(f"Detected encoding: {encoding_detected}")
+
+                # Read CSV with detected encoding
+            df = pd.read_csv(filename, usecols=[0, 1], names=["Second", "Volt"], dtype=str, header=None, on_bad_lines='skip', encoding=encoding_detected)
 
 
         except Exception as e:
