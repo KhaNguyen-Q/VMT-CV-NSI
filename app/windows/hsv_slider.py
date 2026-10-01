@@ -17,7 +17,7 @@ data_folder = os.path.join(project_root, "data")
 
 
 class HSVSlider(QWidget):
-    """Tip color controls: red and/or blue translucent tip + area limits."""
+    """Tip color controls: red, blue, or dark-object detection."""
 
     tip_config_signal = pyqtSignal(dict)
 
@@ -30,8 +30,10 @@ class HSVSlider(QWidget):
         self.cfg = normalize_tip_hsv(loaded if loaded else DEFAULT_TIP_HSV)
 
         self.mode_combo = QComboBox(self)
-        self.mode_combo.addItems(["Both (red or blue)", "Red only", "Blue only"])
-        mode_to_index = {"both": 0, "red": 1, "blue": 2}
+        self.mode_combo.addItems(
+            ["Both (red or blue)", "Red only", "Blue only", "Black only"]
+        )
+        mode_to_index = {"both": 0, "red": 1, "blue": 2, "black": 3}
         self.mode_combo.setCurrentIndex(mode_to_index.get(self.cfg["mode"], 0))
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
 
@@ -45,6 +47,9 @@ class HSVSlider(QWidget):
         self.create_slider("smax", 0, 255, red["smax"])
         self.create_slider("vmin", 0, 255, red["vmin"])
         self.create_slider("vmax", 0, 255, red["vmax"])
+        self.create_slider(
+            "black_vmax", 0, 255, self.cfg["black"]["vmax"]
+        )
         self.create_slider("min_area", 1, 20000, self.cfg["min_area"])
         self.create_slider("max_area", 100, 500000, self.cfg["max_area"])
 
@@ -60,17 +65,23 @@ class HSVSlider(QWidget):
         self.add_to_layout(layout, "smax", 2)
         self.add_to_layout(layout, "vmin", 3)
         self.add_to_layout(layout, "vmax", 4)
-        self.add_to_layout(layout, "min_area", 5)
-        self.add_to_layout(layout, "max_area", 6)
-        layout.addWidget(self.save_button, 7, 0)
-        layout.addWidget(self.reset_button, 7, 1)
+        self.labels["black_vmax"].setText("Black max V:")
+        self.sliders["black_vmax"].setToolTip(
+            "Pixels at or below this brightness are treated as black. "
+            "Raise it for a lighter line; lower it to reject shadows."
+        )
+        self.add_to_layout(layout, "black_vmax", 5)
+        self.add_to_layout(layout, "min_area", 6)
+        self.add_to_layout(layout, "max_area", 7)
+        layout.addWidget(self.save_button, 8, 0)
+        layout.addWidget(self.reset_button, 8, 1)
         hint = QLabel(
-            "Tip: use Mask view. Lower smin if translucent. "
-            "Raise max_area so the whole tip is accepted; min_area rejects noise. "
-            "Tracker picks the largest in-range blob and boxes it as the tip ROI."
+            "Use Mask view to tune detection. Black mode selects pixels by low "
+            "brightness; red/blue modes use the shared S/V sliders. "
+            "Area limits reject noise and oversized regions."
         )
         hint.setWordWrap(True)
-        layout.addWidget(hint, 8, 0, 1, 3)
+        layout.addWidget(hint, 9, 0, 1, 3)
         self.setLayout(layout)
 
     def create_slider(self, name, min_val, max_val, value):
@@ -100,7 +111,7 @@ class HSVSlider(QWidget):
 
     def _mode_key(self):
         idx = self.mode_combo.currentIndex()
-        return {0: "both", 1: "red", 2: "blue"}[idx]
+        return {0: "both", 1: "red", 2: "blue", 3: "black"}[idx]
 
     def current_config(self):
         smin = self.sliders["smin"].value()
@@ -114,6 +125,7 @@ class HSVSlider(QWidget):
             cfg[color]["smax"] = smax
             cfg[color]["vmin"] = vmin
             cfg[color]["vmax"] = vmax
+        cfg["black"]["vmax"] = self.sliders["black_vmax"].value()
         cfg["min_area"] = self.sliders["min_area"].value()
         cfg["max_area"] = self.sliders["max_area"].value()
         return cfg
@@ -139,6 +151,7 @@ class HSVSlider(QWidget):
         self.sliders["smax"].setValue(red["smax"])
         self.sliders["vmin"].setValue(red["vmin"])
         self.sliders["vmax"].setValue(red["vmax"])
+        self.sliders["black_vmax"].setValue(self.cfg["black"]["vmax"])
         self.sliders["min_area"].setValue(self.cfg["min_area"])
         self.sliders["max_area"].setValue(self.cfg["max_area"])
         self.emit_tip_config()

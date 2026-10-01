@@ -10,6 +10,8 @@ from PyQt5.QtWidgets import (
     QDoubleSpinBox,
     QSpinBox,
     QComboBox,
+    QGroupBox,
+    QHBoxLayout,
 )
 from utils.utils import save_json, get_project_root
 
@@ -112,6 +114,24 @@ class AnalyzeWidget(QWidget):
             "Scales plot, CSV, and fits. Use 1.0 when file FPS matches real time."
         )
 
+        self.graph_time_start_spin = QDoubleSpinBox()
+        self.graph_time_start_spin.setDecimals(6)
+        self.graph_time_start_spin.setRange(-1e9, 1e9)
+        self.graph_time_start_spin.setSingleStep(0.1)
+        self.graph_time_start_spin.setSuffix(" s")
+        self.graph_time_start_spin.setToolTip(
+            "First time included in the exported graph."
+        )
+
+        self.graph_time_end_spin = QDoubleSpinBox()
+        self.graph_time_end_spin.setDecimals(6)
+        self.graph_time_end_spin.setRange(-1e9, 1e9)
+        self.graph_time_end_spin.setSingleStep(0.1)
+        self.graph_time_end_spin.setSuffix(" s")
+        self.graph_time_end_spin.setToolTip(
+            "Last time included in the exported graph."
+        )
+
         self.fit_model_combo = QComboBox()
         self.fit_model_combo.addItem("Damped (underdamped)", "damped")
         self.fit_model_combo.addItem("Simple (undamped)", "simple")
@@ -196,12 +216,20 @@ class AnalyzeWidget(QWidget):
         layout.addWidget(QLabel("Fit model: "), 7, 0)
         layout.addWidget(self.fit_model_combo, 7, 1, 1, 2)
 
-        layout.addWidget(self.curve_fit_button, 8, 0)
-        layout.addWidget(self.save_button, 8, 1)
-        layout.addWidget(self.export_csv_button, 8, 2)
-        layout.addWidget(self.export_graph_button, 8, 3)
-        layout.addWidget(self.zero_y_button, 8, 4)
-        layout.addWidget(self.peak_to_peak_button, 8, 5)
+        graph_range_group = QGroupBox("Graph time range")
+        graph_range_layout = QHBoxLayout(graph_range_group)
+        graph_range_layout.addWidget(QLabel("Start:"))
+        graph_range_layout.addWidget(self.graph_time_start_spin)
+        graph_range_layout.addWidget(QLabel("End:"))
+        graph_range_layout.addWidget(self.graph_time_end_spin)
+        layout.addWidget(graph_range_group, 8, 0, 1, 6)
+
+        layout.addWidget(self.curve_fit_button, 9, 0)
+        layout.addWidget(self.save_button, 9, 1)
+        layout.addWidget(self.export_csv_button, 9, 2)
+        layout.addWidget(self.export_graph_button, 9, 3)
+        layout.addWidget(self.zero_y_button, 9, 4)
+        layout.addWidget(self.peak_to_peak_button, 9, 5)
 
         self.setLayout(layout)
 
@@ -236,6 +264,20 @@ class AnalyzeWidget(QWidget):
 
     def time_scale(self):
         return float(self.time_scale_spin.value())
+
+    def export_time_range(self):
+        return (
+            float(self.graph_time_start_spin.value()),
+            float(self.graph_time_end_spin.value()),
+        )
+
+    def set_export_time_range(self, start, end):
+        start = float(start)
+        end = float(end)
+        self.graph_time_start_spin.setRange(start, end)
+        self.graph_time_end_spin.setRange(start, end)
+        self.graph_time_start_spin.setValue(start)
+        self.graph_time_end_spin.setValue(end)
 
     def update_params(self, params, analytics=None, fit_model="damped"):
         """

@@ -5,7 +5,7 @@ import numpy as np
 
 # OpenCV HSV: H in [0, 179]. Red wraps around 0; blue is mid-range.
 DEFAULT_TIP_HSV = {
-    "mode": "both",  # both | red | blue
+    "mode": "both",  # both | red | blue | black
     "red": {
         "hmin": 0,
         "hmax": 10,
@@ -24,6 +24,7 @@ DEFAULT_TIP_HSV = {
         "vmin": 50,
         "vmax": 255,
     },
+    "black": {"vmax": 70},
     "min_area": 30,
     # Whole tip blobs are often >> 20k px² at detect resolution
     "max_area": 200000,
@@ -36,18 +37,21 @@ def normalize_tip_hsv(hsv_vals: dict | None) -> dict:
         "mode": DEFAULT_TIP_HSV["mode"],
         "red": dict(DEFAULT_TIP_HSV["red"]),
         "blue": dict(DEFAULT_TIP_HSV["blue"]),
+        "black": dict(DEFAULT_TIP_HSV["black"]),
         "min_area": DEFAULT_TIP_HSV["min_area"],
         "max_area": DEFAULT_TIP_HSV["max_area"],
     }
     if not hsv_vals:
         return cfg
 
-    if "red" in hsv_vals or "blue" in hsv_vals or "mode" in hsv_vals:
+    if "red" in hsv_vals or "blue" in hsv_vals or "black" in hsv_vals or "mode" in hsv_vals:
         cfg["mode"] = hsv_vals.get("mode", cfg["mode"])
         if "red" in hsv_vals:
             cfg["red"].update(hsv_vals["red"])
         if "blue" in hsv_vals:
             cfg["blue"].update(hsv_vals["blue"])
+        if "black" in hsv_vals:
+            cfg["black"].update(hsv_vals["black"])
         cfg["min_area"] = int(hsv_vals.get("min_area", cfg["min_area"]))
         cfg["max_area"] = int(hsv_vals.get("max_area", cfg["max_area"]))
         return cfg
@@ -128,6 +132,12 @@ class ImageProcessor:
                 blue["vmax"],
             )
             mask = cv2.bitwise_or(mask, mask_blue)
+
+        if mode == "black":
+            black = self.hsv_vals["black"]
+            mask = self._range_mask(
+                hsv, 0, 179, 0, 255, 0, black["vmax"]
+            )
 
         kernel = np.ones((3, 3), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
