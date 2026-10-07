@@ -500,6 +500,6 @@ def clean_csv(
 if __name__ == "__main__":
         # Paths are relative to the repo root
         _repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-        input_file = os.path.join(_repo_root, "data", "csv", "OscilliscopeCSV(in).csv")
+        input_file = os.path.join(_repo_root, "data", "csv", "tracked_tip_y.csv")
         output_file = os.path.join(_repo_root, "data", "csv", "OscilliscopeCSV(out).csv")
         clean_csv(input_file, output_file, show_plot=True)

@@ -403,20 +403,35 @@ class AppWindow(QWidget):
             QMessageBox.warning(self, "ROI", "Could not read a frame from the video.")
             return
 
-        # Interactive OpenCV ROI on a preview window
-        preview = frame.copy()
+        # Select on a screen-sized preview, then map the ROI back to source pixels.
+        frame_h, frame_w = frame.shape[:2]
+        scale = min(1.0, 1000 / frame_w, 650 / frame_h)
+        preview_w = max(1, round(frame_w * scale))
+        preview_h = max(1, round(frame_h * scale))
+        preview = (
+            cv2.resize(frame, (preview_w, preview_h), interpolation=cv2.INTER_AREA)
+            if scale < 1.0
+            else frame.copy()
+        )
         cv2.putText(
             preview,
             "Drag tip ROI, ENTER/SPACE confirm, c cancel",
-            (20, 40),
+            (12, 28),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
+            0.6,
             (0, 255, 255),
             2,
         )
-        roi = cv2.selectROI("Select tip ROI", preview, showCrosshair=True, fromCenter=False)
+        x, y, w, h = cv2.selectROI(
+            "Select tip ROI", preview, showCrosshair=True, fromCenter=False
+        )
         cv2.destroyWindow("Select tip ROI")
-        x, y, w, h = [int(v) for v in roi]
+        if w > 0 and h > 0:
+            x0 = round(x * frame_w / preview_w)
+            y0 = round(y * frame_h / preview_h)
+            x1 = round((x + w) * frame_w / preview_w)
+            y1 = round((y + h) * frame_h / preview_h)
+            x, y, w, h = x0, y0, x1 - x0, y1 - y0
         if w < 8 or h < 8:
             QMessageBox.information(self, "ROI", "ROI too small — keeping previous/full frame.")
             return
@@ -559,6 +574,7 @@ class AppWindow(QWidget):
                 frame_height=fh,
             )
             self.data_points.clear()
+            self.analyze_widget.set_export_time_range(0.0, 0.0)
             self._plot_t.clear()
             self._plot_y.clear()
             self._plot_since_refresh = 0
@@ -675,6 +691,9 @@ class AppWindow(QWidget):
             tip_l = self.thread.params.get("tip_length_px_med")
             self._tip_length_px_med = float(tip_l) if tip_l is not None else None
             self.analyze_widget.show_params(dict(self.thread.params))
+        if self.data_points:
+            times = [point[0] for point in self.data_points]
+            self.analyze_widget.set_export_time_range(min(times), max(times))
         self._refresh_position_plot()
         self._disconnect_thread_signals()
         self.update_button_states(False)
@@ -845,8 +864,23 @@ class AppWindow(QWidget):
         if not path:
             return
         try:
-            t = [p[0] for p in self.data_points]
-            y_px = [p[1] for p in self.data_points]
+            time_start, time_end = self.analyze_widget.export_time_range()
+            if time_start > time_end:
+                QMessageBox.warning(
+                    self,
+                    "Export Graph",
+                    "The start time must be less than or equal to the end time.",
+                )
+                return
+            selected_points = [
+                point
+                for point in self.data_points
+                if time_start <= point[0] <= time_end
+            ]
+            if not selected_points:
+                raise ValueError("No tracked points fall within the selected time range")
+            t = [point[0] for point in selected_points]
+            y_px = [point[1] for point in selected_points]
             times_s, displacement_mm = series_to_mm(t, y_px, mpp)
             export_displacement_vs_time(path, times_s, displacement_mm)
         except Exception as exc:
