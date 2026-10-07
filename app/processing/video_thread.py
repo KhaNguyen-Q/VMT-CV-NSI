@@ -387,15 +387,19 @@ class VideoThread(QThread):
 
     @staticmethod
     def save_timeseries_csv(
-        filename, data_points, mm_per_pixel=0.0, motion_axis="x"
+        filename, data_points, mm_per_pixel=0.0, motion_axis="x", path=None
     ):
         """
         Save tracked series.
         data_points: iterable of (time_s, position_px) along motion_axis.
+        path: full output path. When omitted, writes data/csv/{filename}.
         """
         axis = "y" if motion_axis == "y" else "x"
-        path = os.path.join(data_folder, "csv", filename)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if path is None:
+            path = os.path.join(data_folder, "csv", filename)
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(path, "w", newline="") as csvfile:
             csv_writer = csv.writer(csvfile)
             csv_writer.writerow(

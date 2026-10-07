@@ -24,6 +24,7 @@ from processing.video_thread import VideoThread
 from windows.hsv_slider import HSVSlider
 from windows.analyze_widget import AnalyzeWidget
 from windows.graph_viewbox import GraphViewBox
+from windows.compare_window import CompareWindow
 from utils.utils import (
     underdamped_harmonic_oscillator,
     simple_harmonic_oscillator,
@@ -38,8 +39,6 @@ from utils.utils import (
 from utils.plot_export import (
     series_to_mm,
     export_displacement_vs_time,
-    default_plot_path,
-    default_peak_to_peak_plot_path,
     export_peak_to_peak_plot,
 )
 from utils.contansts import (
@@ -61,7 +60,7 @@ class AppWindow(QWidget):
         self.postion_plot_color = QColor(3, 252, 194)
         self.fitted_plot_color = QColor(255, 127, 80)
 
-        self.setWindowTitle("1D Spring/Slider Oscillator")
+        self.setWindowTitle("NSI image capture")
         self.disply_width = 1280
         self.display_height = 720
         self.video_path = None
@@ -82,6 +81,7 @@ class AppWindow(QWidget):
         self.roi = None  # (x, y, w, h) or None
         self._frame_width = 0
         self._frame_height = 0
+        self._compare_window = None
 
         self.create_buttons()
         self.create_labels()
@@ -273,6 +273,12 @@ class AppWindow(QWidget):
         button_layout.addWidget(QLabel("H:"))
         button_layout.addWidget(self.frame_height_spin)
         button_layout.addWidget(self.draw_param_button)
+        self.compare_button = QPushButton("Compare…", self)
+        self.compare_button.setToolTip(
+            "Open a separate window to overlay two exported tracking CSVs."
+        )
+        self.compare_button.clicked.connect(self.open_compare_window)
+        button_layout.addWidget(self.compare_button)
 
         video_graph_splitter = QSplitter(Qt.Horizontal)
         video_graph_splitter.addWidget(self.video_label)
@@ -298,6 +304,13 @@ class AppWindow(QWidget):
         grid_layout.setRowStretch(2, 1)
         grid_layout.setRowStretch(3, 0)
         self.setLayout(grid_layout)
+
+    def open_compare_window(self):
+        if self._compare_window is None:
+            self._compare_window = CompareWindow()
+        self._compare_window.show()
+        self._compare_window.raise_()
+        self._compare_window.activateWindow()
 
     @pyqtSlot()
     def url_submission(self):
@@ -772,17 +785,42 @@ class AppWindow(QWidget):
             "mm/pixel ≈ tip_mm / Tip L (px) after tuning Mask/HSV.",
         )
 
+    def _choose_save_path(self, title, start_dir, suggested_name, file_filter, extension):
+        """Save dialog. Returns the chosen path, or None if cancelled."""
+        os.makedirs(start_dir, exist_ok=True)
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            title,
+            os.path.join(start_dir, suggested_name),
+            file_filter,
+        )
+        if not path:
+            return None
+        if extension and not path.lower().endswith(extension):
+            path += extension
+        return path
+
     @pyqtSlot()
     def export_csv(self):
         if not self.data_points:
             QMessageBox.warning(self, "Export CSV", "No tracked data to export.")
             return
         axis = self.selected_motion_axis
-        path = VideoThread.save_timeseries_csv(
+        path = self._choose_save_path(
+            "Export CSV",
+            os.path.join(project_root, "data", "csv"),
             f"tracked_tip_{axis}.csv",
+            "CSV files (*.csv);;All files (*)",
+            ".csv",
+        )
+        if not path:
+            return
+        path = VideoThread.save_timeseries_csv(
+            os.path.basename(path),
             self.data_points,
             mm_per_pixel=self.analyze_widget.mm_per_pixel(),
             motion_axis=axis,
+            path=path,
         )
         QMessageBox.information(self, "Export CSV", f"Saved:\n{path}")
 
@@ -796,12 +834,20 @@ class AppWindow(QWidget):
                 "Set mm/pixel > 0 and run Estimate successfully before exporting.",
             )
             return
+        axis = self.selected_motion_axis
+        path = self._choose_save_path(
+            "Export Graph",
+            os.path.join(project_root, "data", "plots"),
+            f"displacement_vs_time_{axis}.png",
+            "PNG images (*.png);;All files (*)",
+            ".png",
+        )
+        if not path:
+            return
         try:
             t = [p[0] for p in self.data_points]
             y_px = [p[1] for p in self.data_points]
             times_s, displacement_mm = series_to_mm(t, y_px, mpp)
-            axis = self.selected_motion_axis
-            path = default_plot_path(project_root, axis)
             export_displacement_vs_time(path, times_s, displacement_mm)
         except Exception as exc:
             QMessageBox.warning(self, "Export Graph", f"Failed to export graph:\n{exc}")
@@ -827,10 +873,6 @@ class AppWindow(QWidget):
                 )
                 return
 
-            csv_dir = os.path.join(project_root, "data", "csv")
-            csv_path = os.path.join(csv_dir, f"peak_to_peak_{axis}.csv")
-            write_peak_to_peak_csv(csv_path, rows)
-
             tops_t, tops_y = [], []
             bottoms_t, bottoms_y = [], []
             plateaus_t, plateaus_y = [], []
@@ -849,16 +891,39 @@ class AppWindow(QWidget):
             self.peak_bottom_plot.setData(x=bottoms_t, y=bottoms_y)
             self.peak_plateau_plot.setData(x=plateaus_t, y=plateaus_y)
 
-            png_path = default_peak_to_peak_plot_path(project_root, axis)
-            export_peak_to_peak_plot(png_path, t, y_px, rows, axis=axis)
+            csv_path = self._choose_save_path(
+                "Save peak-to-peak CSV",
+                os.path.join(project_root, "data", "csv"),
+                f"peak_to_peak_{axis}.csv",
+                "CSV files (*.csv);;All files (*)",
+                ".csv",
+            )
+            if csv_path:
+                write_peak_to_peak_csv(csv_path, rows)
+
+            png_path = self._choose_save_path(
+                "Save peak-to-peak graph",
+                os.path.join(project_root, "data", "plots"),
+                f"peak_to_peak_{axis}.png",
+                "PNG images (*.png);;All files (*)",
+                ".png",
+            )
+            if png_path:
+                export_peak_to_peak_plot(png_path, t, y_px, rows, axis=axis)
         except Exception as exc:
             QMessageBox.warning(
                 self, "Peak to Peak", f"Failed to compute peak-to-peak:\n{exc}"
             )
             return
 
+        saved = []
+        if csv_path:
+            saved.append(f"CSV:\n{csv_path}")
+        if png_path:
+            saved.append(f"PNG:\n{png_path}")
+        detail = "\n".join(saved) if saved else "No files saved."
         QMessageBox.information(
             self,
             "Peak to Peak",
-            f"Found {len(rows)} extrema.\nSaved CSV:\n{csv_path}\nSaved PNG:\n{png_path}",
+            f"Found {len(rows)} extrema.\n{detail}",
         )

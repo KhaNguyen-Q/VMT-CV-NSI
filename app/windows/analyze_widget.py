@@ -138,8 +138,8 @@ class AnalyzeWidget(QWidget):
         self.peak_to_peak_button = QPushButton("Peak to Peak")
         self.peak_to_peak_button.setEnabled(False)
         self.peak_to_peak_button.setToolTip(
-            "Find local extrema, overlay markers, and save "
-            "peak_to_peak_{axis}.csv + PNG."
+            "Find local extrema, overlay markers, then choose where to save "
+            "the CSV and PNG."
         )
 
     def create_layout(self):
