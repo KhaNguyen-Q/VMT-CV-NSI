@@ -5,26 +5,33 @@ import os
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
     QMessageBox,
     QPushButton,
+    QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from utils.utils import dominant_fft_frequency, get_project_root
+from utils.utils import (
+    dominant_fft_frequency,
+    find_peak_to_peak_extrema,
+    get_project_root,
+)
 from windows.graph_viewbox import GraphViewBox
 
 _project_root = get_project_root(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _read_tracking_csv(path):
-    """Return time and position columns from an exported tracking CSV."""
+    """Read a tracking CSV or peak-to-peak extrema CSV for comparison."""
     with open(path, newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     if not rows:
@@ -34,9 +41,13 @@ def _read_tracking_csv(path):
         raise ValueError("CSV needs a time_s column")
 
     px_col = next((name for name in ("x_px", "y_px") if name in fields), None)
+    if px_col is None and "position_px" in fields:
+        px_col = "position_px"
     mm_col = next((name for name in ("x_mm", "y_mm") if name in fields), None)
     if px_col is None and mm_col is None:
-        raise ValueError("CSV needs an x_px/y_px or x_mm/y_mm column")
+        raise ValueError(
+            "CSV needs an x_px/y_px, x_mm/y_mm, or peak-to-peak position_px column"
+        )
 
     times = []
     px = []
@@ -161,6 +172,140 @@ def comparison_outliers(t_base, y_base, t_cmp, y_cmp, offset, n_sigmas=3.0):
     return t[keep], y_c[keep], y_b[keep], residual[keep]
 
 
+def behavior_outliers(
+    t_base, y_base, t_cmp, y_cmp, offset, phase_ranges, n_sigmas=3.0
+):
+    """Compare cycle counts and peak-to-peak amplitudes in labeled baseline ranges."""
+    findings = []
+    for phase in phase_ranges:
+        start = phase["start_s"]
+        end = phase["end_s"]
+        baseline_mask = (t_base >= start) & (t_base <= end)
+        compare_start = start - offset
+        compare_end = end - offset
+        compare_mask = (t_cmp >= compare_start) & (t_cmp <= compare_end)
+
+        baseline_extrema = find_peak_to_peak_extrema(
+            t_base[baseline_mask], y_base[baseline_mask]
+        )
+        compare_extrema = find_peak_to_peak_extrema(
+            t_cmp[compare_mask], y_cmp[compare_mask]
+        )
+        baseline_cycles = min(
+            sum(row["label"] == "top" for row in baseline_extrema),
+            sum(row["label"] == "bottom" for row in baseline_extrema),
+        )
+        compare_cycles = min(
+            sum(row["label"] == "top" for row in compare_extrema),
+            sum(row["label"] == "bottom" for row in compare_extrema),
+        )
+        expected_cycles = phase["expected_cycles"] or baseline_cycles
+
+        if (
+            phase["expected_cycles"]
+            and baseline_cycles != phase["expected_cycles"]
+        ):
+            findings.append(
+                {
+                    "finding_type": "baseline_cycle_count",
+                    "phase": phase["label"],
+                    "time_s": start,
+                    "expected": phase["expected_cycles"],
+                    "observed": baseline_cycles,
+                    "ratio": "",
+                    "baseline_pos": "",
+                    "compare_pos": "",
+                    "residual": "",
+                    "tag": "baseline expectation mismatch",
+                    "details": (
+                        f"Selected baseline range contains {baseline_cycles} "
+                        f"complete cycles; configured expectation is "
+                        f"{phase['expected_cycles']}."
+                    ),
+                }
+            )
+
+        if compare_cycles != expected_cycles:
+            if compare_cycles < expected_cycles:
+                description = (
+                    f"Not enough cycles as expected for {phase['label']}"
+                )
+            else:
+                description = f"Too many cycles for {phase['label']}"
+            findings.append(
+                {
+                    "finding_type": "cycle_count",
+                    "phase": phase["label"],
+                    "time_s": start,
+                    "expected": expected_cycles,
+                    "observed": compare_cycles,
+                    "ratio": (
+                        compare_cycles / expected_cycles
+                        if expected_cycles
+                        else ""
+                    ),
+                    "baseline_pos": "",
+                    "compare_pos": "",
+                    "residual": "",
+                    "tag": "outlier",
+                    "details": description,
+                }
+            )
+
+        baseline_amplitudes = np.asarray(
+            [
+                row["peak_to_peak_px"]
+                for row in baseline_extrema
+                if row["peak_to_peak_px"] is not None
+            ],
+            dtype=float,
+        )
+        if baseline_amplitudes.size < 3:
+            continue
+
+        amplitude_median = float(np.median(baseline_amplitudes))
+        amplitude_mad = float(
+            np.median(np.abs(baseline_amplitudes - amplitude_median))
+        )
+        threshold = n_sigmas * 1.4826 * amplitude_mad
+        if amplitude_mad == 0:
+            threshold = max(abs(amplitude_median) * 1e-6, 1e-9)
+
+        for row in compare_extrema:
+            amplitude = row["peak_to_peak_px"]
+            if amplitude is None or abs(amplitude - amplitude_median) <= threshold:
+                continue
+            compare_time = row["time_s"] + offset
+            baseline_position = (
+                float(np.interp(compare_time, t_base, y_base))
+                if t_base[0] <= compare_time <= t_base[-1]
+                else ""
+            )
+            findings.append(
+                {
+                    "finding_type": "peak_to_peak_amplitude",
+                    "phase": phase["label"],
+                    "time_s": compare_time,
+                    "expected": amplitude_median,
+                    "observed": float(amplitude),
+                    "ratio": (
+                        float(amplitude / amplitude_median)
+                        if amplitude_median
+                        else ""
+                    ),
+                    "baseline_pos": baseline_position,
+                    "compare_pos": float(row["position_px"]),
+                    "residual": "",
+                    "tag": "outlier",
+                    "details": (
+                        f"Peak-to-peak amplitude differs from the baseline "
+                        f"median by more than {n_sigmas:g} robust sigmas."
+                    ),
+                }
+            )
+    return findings
+
+
 class CompareWindow(QWidget):
     def __init__(self):
         super().__init__()
@@ -169,13 +314,15 @@ class CompareWindow(QWidget):
         self._baseline = None
         self._compare = None
         self._outlier_rows = []
+        self._phase_ranges = []
         self._setting_offset = False
+        self._phase_region = None
 
         layout = QVBoxLayout(self)
 
         self.graph_layout = pg.GraphicsLayoutWidget()
         self.plot = self.graph_layout.addPlot(
-            title="Baseline vs compare",
+            title="Baseline plot vs Compare plot",
             viewBox=GraphViewBox(),
         )
         self.graph_layout.setToolTip(
@@ -201,9 +348,9 @@ class CompareWindow(QWidget):
 
         self.outlier_plot = self.plot.plot(
             pen=None,
-            symbol="o",
+            symbol="O",
             symbolSize=8,
-            symbolPen=pg.mkPen(color=(255, 80, 80), width=1),
+            symbolPen=pg.mkPen(color=(255, 80, 80), width=3),
             symbolBrush=pg.mkBrush(255, 80, 80),
             name="Outliers",
         )
@@ -231,8 +378,57 @@ class CompareWindow(QWidget):
         self.save_btn.setEnabled(False)
         self.save_btn.clicked.connect(self._save_outliers)
         controls.addWidget(self.save_btn)
+        controls.addWidget(QLabel("Outlier sensitivity (robust sigmas):"))
+        self.sensitivity_spin = QDoubleSpinBox()
+        self.sensitivity_spin.setRange(0.1, 10.0)
+        self.sensitivity_spin.setDecimals(1)
+        self.sensitivity_spin.setSingleStep(0.5)
+        self.sensitivity_spin.setValue(3.0)
+        self.sensitivity_spin.valueChanged.connect(self._on_sensitivity_changed)
+        controls.addWidget(self.sensitivity_spin)
         controls.addStretch(1)
         layout.addLayout(controls)
+
+        phase_controls = QHBoxLayout()
+        phase_controls.addWidget(QLabel("Baseline behavior:"))
+        self.phase_combo = QComboBox()
+        self.phase_combo.setEditable(True)
+        self.phase_combo.addItems(["Phase 1", "Blurb", "Continuation", "Other"])
+        self.phase_combo.currentTextChanged.connect(
+            self._on_phase_label_changed
+        )
+        phase_controls.addWidget(self.phase_combo)
+        phase_controls.addWidget(QLabel("Expected cycles (0 = baseline count):"))
+        self.expected_cycles_spin = QSpinBox()
+        self.expected_cycles_spin.setRange(0, 10000)
+        self.expected_cycles_spin.setValue(11)
+        phase_controls.addWidget(self.expected_cycles_spin)
+        self.add_phase_btn = QPushButton("Add selected baseline range")
+        self.add_phase_btn.setToolTip(
+            "Drag the blue region's edges on the plot to select a baseline "
+            "behavior range, then add it here."
+        )
+        self.add_phase_btn.setEnabled(False)
+        self.add_phase_btn.clicked.connect(self._add_phase_range)
+        phase_controls.addWidget(self.add_phase_btn)
+        self.remove_phase_btn = QPushButton("Remove selected range")
+        self.remove_phase_btn.setEnabled(False)
+        self.remove_phase_btn.clicked.connect(self._remove_phase_range)
+        phase_controls.addWidget(self.remove_phase_btn)
+        phase_controls.addStretch(1)
+        layout.addLayout(phase_controls)
+
+        self.phase_table = QTableWidget(0, 4)
+        self.phase_table.setHorizontalHeaderLabels(
+            ["Behavior", "Start (s)", "End (s)", "Expected cycles"]
+        )
+        self.phase_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.phase_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.phase_table.setMaximumHeight(120)
+        self.phase_table.itemSelectionChanged.connect(
+            self._on_phase_selection_changed
+        )
+        layout.addWidget(self.phase_table)
 
         self.status = QLabel("Load a baseline CSV and a compare CSV.")
         self.status.setWordWrap(True)
@@ -262,6 +458,20 @@ class CompareWindow(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "Load baseline", f"Failed to load CSV:\n{exc}")
             return
+        self._phase_ranges = []
+        self.phase_table.setRowCount(0)
+        if self._phase_region is not None:
+            self.plot.removeItem(self._phase_region)
+        t = self._baseline["time_s"]
+        self._phase_region = pg.LinearRegionItem(
+            values=(float(t[0]), float(t[-1])),
+            brush=pg.mkBrush(80, 160, 255, 45),
+            pen=pg.mkPen(80, 160, 255, 180),
+        )
+        self._phase_region.setBounds((float(t[0]), float(t[-1])))
+        self._phase_region.setZValue(-10)
+        self.plot.addItem(self._phase_region)
+        self.add_phase_btn.setEnabled(True)
         self._align_and_redraw(estimate_offset=True)
 
     def _load_compare(self):
@@ -279,6 +489,71 @@ class CompareWindow(QWidget):
         if self._setting_offset:
             return
         self._align_and_redraw(estimate_offset=False)
+
+    def _on_sensitivity_changed(self, _value):
+        self._align_and_redraw(estimate_offset=False)
+
+    def _on_phase_label_changed(self, label):
+        self.expected_cycles_spin.setValue(11 if label == "Phase 1" else 0)
+
+    def _add_phase_range(self):
+        if self._phase_region is None:
+            return
+        start, end = sorted(float(value) for value in self._phase_region.getRegion())
+        if end <= start:
+            QMessageBox.warning(
+                self, "Add behavior range", "Select a non-empty baseline time range."
+            )
+            return
+        if any(
+            start < phase["end_s"] and end > phase["start_s"]
+            for phase in self._phase_ranges
+        ):
+            QMessageBox.warning(
+                self,
+                "Add behavior range",
+                "Behavior ranges cannot overlap. Adjust the selected range and try again.",
+            )
+            return
+
+        self._phase_ranges.append(
+            {
+                "label": self.phase_combo.currentText(),
+                "start_s": start,
+                "end_s": end,
+                "expected_cycles": self.expected_cycles_spin.value(),
+            }
+        )
+        self._phase_ranges.sort(key=lambda phase: phase["start_s"])
+        self._refresh_phase_table()
+        self._align_and_redraw(estimate_offset=False)
+
+    def _remove_phase_range(self):
+        selected_rows = sorted(
+            {index.row() for index in self.phase_table.selectionModel().selectedRows()},
+            reverse=True,
+        )
+        for row in selected_rows:
+            del self._phase_ranges[row]
+        self._refresh_phase_table()
+        self._align_and_redraw(estimate_offset=False)
+
+    def _refresh_phase_table(self):
+        self.phase_table.setRowCount(len(self._phase_ranges))
+        for row, phase in enumerate(self._phase_ranges):
+            values = (
+                phase["label"],
+                f"{phase['start_s']:.4f}",
+                f"{phase['end_s']:.4f}",
+                str(phase["expected_cycles"] or "baseline"),
+            )
+            for column, value in enumerate(values):
+                self.phase_table.setItem(row, column, QTableWidgetItem(value))
+        self.remove_phase_btn.setEnabled(bool(self._phase_ranges))
+
+    def _on_phase_selection_changed(self):
+        selected = self.phase_table.selectionModel().selectedRows()
+        self.remove_phase_btn.setEnabled(bool(selected))
 
     def _use_mm(self):
         series = [item for item in (self._baseline, self._compare) if item is not None]
@@ -330,23 +605,58 @@ class CompareWindow(QWidget):
             mean_c = None
 
         if both:
-            ot, oy, ob, residual = comparison_outliers(t_b, y_b, t_c, y_c, offset)
+            sensitivity = float(self.sensitivity_spin.value())
+            ot, oy, ob, residual = comparison_outliers(
+                t_b, y_b, t_c, y_c, offset, n_sigmas=sensitivity
+            )
             self.outlier_plot.setData(x=ot, y=oy)
             self._outlier_rows = [
                 {
+                    "finding_type": "point_residual",
+                    "phase": "",
                     "time_s": float(ot[i]),
+                    "expected": "",
+                    "observed": "",
+                    "ratio": "",
                     "baseline_pos": float(ob[i]),
                     "compare_pos": float(oy[i]),
                     "residual": float(residual[i]),
                     "tag": "outlier",
+                    "details": "Point residual exceeds the overlap MAD threshold.",
                 }
                 for i in range(ot.size)
             ]
+            behavior_findings = behavior_outliers(
+                t_b,
+                y_b,
+                t_c,
+                y_c,
+                offset,
+                self._phase_ranges,
+                n_sigmas=sensitivity,
+            )
+            self._outlier_rows.extend(behavior_findings)
+            plotted_findings = [
+                row
+                for row in behavior_findings
+                if row["finding_type"] == "peak_to_peak_amplitude"
+            ]
+            if plotted_findings:
+                self.outlier_plot.setData(
+                    x=np.concatenate(
+                        (ot, [row["time_s"] for row in plotted_findings])
+                    ),
+                    y=np.concatenate(
+                        (oy, [row["compare_pos"] for row in plotted_findings])
+                    ),
+                )
         self.save_btn.setEnabled(both)
         self.plot.enableAutoRange()
-        self._set_status(use_mm, mean_b, mean_c, offset if both else None)
+        self._set_status(
+            use_mm, mean_b, mean_c, offset if both else None, self._outlier_rows
+        )
 
-    def _set_status(self, use_mm, mean_b, mean_c, offset):
+    def _set_status(self, use_mm, mean_b, mean_c, offset, findings):
         unit = "mm" if use_mm else "px"
         parts = []
         if self._baseline is not None and mean_b is not None:
@@ -358,8 +668,26 @@ class CompareWindow(QWidget):
                 f"Compare {self._compare['name']}: subtracted mean {mean_c:.3f} {unit}"
             )
         if offset is not None:
+            cycle_findings = [
+                row
+                for row in findings
+                if row["finding_type"] in ("cycle_count", "baseline_cycle_count")
+            ]
+            amplitude_findings = sum(
+                row["finding_type"] == "peak_to_peak_amplitude"
+                for row in findings
+            )
             parts.append(
-                f"Phase offset {offset:.4f} s. Outliers: {len(self._outlier_rows)}"
+                f"Phase offset {offset:.4f} s. Point outliers: "
+                f"{sum(row['finding_type'] == 'point_residual' for row in findings)}; "
+                f"cycle/amplitude findings: "
+                f"{len(cycle_findings) + amplitude_findings}"
+            )
+            parts.extend(row["details"] for row in cycle_findings)
+        if not self._phase_ranges and self._baseline is not None:
+            parts.append(
+                "Select and add baseline behavior ranges to compare cycle counts "
+                "and peak-to-peak amplitudes."
             )
         self.status.setText(" | ".join(parts) if parts else "Load a baseline CSV and a compare CSV.")
 
@@ -384,7 +712,19 @@ class CompareWindow(QWidget):
         parent = os.path.dirname(os.path.abspath(path))
         if parent:
             os.makedirs(parent, exist_ok=True)
-        fieldnames = ["time_s", "baseline_pos", "compare_pos", "residual", "tag"]
+        fieldnames = [
+            "finding_type",
+            "phase",
+            "time_s",
+            "expected",
+            "observed",
+            "ratio",
+            "baseline_pos",
+            "compare_pos",
+            "residual",
+            "tag",
+            "details",
+        ]
         with open(path, "w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
