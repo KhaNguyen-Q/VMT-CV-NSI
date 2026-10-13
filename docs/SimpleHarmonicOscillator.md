@@ -240,6 +240,24 @@ Also: repeated Run can accumulate HSV signal connections to old threads (messy);
 | `data/csv/estimate_x.csv` or `estimate_y.csv` | Written on **Estimate**: `time_s`, `x_px`/`y_px`, `x_mm`/`y_mm` |
 | `data/csv/tracked_tip_x.csv` or `tracked_tip_y.csv` | Manual **Export CSV** (same columns) |
 | `data/plots/displacement_vs_time_x.png` (or `_y`) | **Export Graph**: Displacement (mm) vs Time (s) |
+| User-selected CSV path | In the Compare window, **Export ranges CSV…** saves baseline and aligned compare statistics per selected behavior range, including time coverage, cycle counts, P2P mean/std and deltas, periods, cycle settings, and smoothing. Compare intervals are mapped using the current phase offset; unavailable measurements are blank. |
+
+For smoothed **Phase 1** ranges, the redraw matches the mean adjacent-extrema
+peak-to-peak amplitude from the loaded tagged extrema; range edges blend back
+to the original signal.
+
+In the Compare window, yellow **Review** markers show point residuals above
+25% of the local baseline span (with a 7.5% overall-span floor). Red **Strong
+outlier** markers require a larger residual, above 40% of the local span (with
+a 15% overall-span floor), sustained for at least 50 ms. These thresholds use
+the raw baseline motion and compare run's residuals against it, rather than the
+smoothed display curve or the residual spread, so smoothing does not create
+point flags and a more different comparison cannot inflate its own cutoff.
+Phase cycle-count differences of one are review flags; larger differences are
+strong. Peak-to-peak
+findings have review and strong thresholds, with the sensitivity control setting
+the strong threshold in standard deviations. The exported outliers CSV records
+the severity in its `tag` column (`review` or `strong_outlier`).
 
 **Export Graph** (matplotlib) is enabled only after **mm/pixel > 0** and a successful **Estimate**. It plots the tracked series in mm with padded auto-limits so peaks are visible. Plot styling lives in `app/utils/plot_export.py`.
 

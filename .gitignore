@@ -8,5 +8,9 @@ dist/
 sample-videos/.
 sample-videos/
 
-test
+test/
+
+*.csv
+*.json
+*plots
 
