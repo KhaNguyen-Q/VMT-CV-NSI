@@ -44,6 +44,7 @@ python app/app.py
 6. Stop → set **mm/pixel** if you have a scale → **Estimate** (Hz, P2P, FFT) → **Export CSV** or **Peak to Peak** for matplotlib graphs and raw csv data
 7. Optional **Visual gain** enlarges the plot/overlay only; stored data stays true pixels/mm.
 
+In the comparison window, **Export report table** creates an internal NSI report and a client-facing report. The client report keeps the phase results and waveform plots, with a results summary, but omits calculation details and internal QA notes. It is saved beside the selected report with `_CLIENT` appended to the filename.
 
 ## Object detection
 

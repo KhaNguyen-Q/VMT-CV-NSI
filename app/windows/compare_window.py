@@ -1995,7 +1995,10 @@ class CompareWindow(QWidget):
                 notes.append(
                     "Phase III is excluded from the overall weighted correlation."
                 )
-            report_sections.append((label, rows, notes, phase_plot))
+            phase_plot_data = phase_plot.getvalue() if phase_plot is not None else None
+            report_sections.append((label, rows, notes, phase_plot_data))
+            if phase_plot is not None:
+                phase_plot.close()
 
         overall_correlation = _weighted_correlation(overall_samples)
         overall_text = (
@@ -2009,85 +2012,130 @@ class CompareWindow(QWidget):
         compare_name = (
             self._compare["name"] if self._compare is not None else "Not loaded"
         )
+        client_path = os.path.splitext(path)[0] + "_CLIENT.docx"
         try:
             parent = os.path.dirname(os.path.abspath(path))
             if parent:
                 os.makedirs(parent, exist_ok=True)
-            document = Document()
-            title = document.add_heading("Waveform Comparison Report", level=1)
-            title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            metadata = document.add_paragraph()
-            metadata.add_run("Baseline: ").bold = True
-            metadata.add_run(baseline_name)
-            metadata.add_run("    Comparison: ").bold = True
-            metadata.add_run(compare_name)
-            metadata.add_run("    Phase offset: ").bold = True
-            metadata.add_run(
-                format_value(offset, " s") if offset is not None else "—"
-            )
 
-            for label, rows, notes, phase_plot in report_sections:
-                heading = document.add_heading(f"{label} table", level=2)
-                heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                table = document.add_table(rows=1, cols=3)
-                table.style = "Table Grid"
-                table.alignment = WD_TABLE_ALIGNMENT.CENTER
-                table.autofit = True
-                header_cells = table.rows[0].cells
-                for cell, text in zip(
-                    header_cells,
-                    ("Measurement differences", "Baseline", "Comparison"),
-                ):
-                    cell.text = text
-                    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-                    for run in cell.paragraphs[0].runs:
-                        run.bold = True
-                    shading = OxmlElement("w:shd")
-                    shading.set(qn("w:fill"), "F2F2F2")
-                    cell._tc.get_or_add_tcPr().append(shading)
-
-                for metric, baseline_value, compare_value in rows:
-                    cells = table.add_row().cells
-                    for cell, text in zip(
-                        cells, (metric, baseline_value, compare_value)
-                    ):
-                        cell.text = str(text)
-                        cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-
-                if phase_plot is not None:
-                    caption = document.add_paragraph(
-                        f"{label} waveform comparison "
-                        "(time shown relative to the start of each selected range)"
-                    )
-                    caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    document.add_picture(phase_plot, width=Inches(6.3))
-                    phase_plot.close()
-
-                notes_paragraph = document.add_paragraph()
-                notes_paragraph.add_run(
-                    f"NSI quality assurance notes ({label}): "
-                ).bold = True
-                notes_paragraph.add_run(
-                    " ".join(notes) if notes else "____________________________"
+            def add_report_content(document, client_facing):
+                title = document.add_heading(
+                    "NSI Client Report" if client_facing else "NSI Report",
+                    level=1,
                 )
+                title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                metadata = document.add_paragraph()
+                metadata.add_run("Baseline: ").bold = True
+                metadata.add_run(baseline_name)
+                metadata.add_run("    Comparison: ").bold = True
+                metadata.add_run(compare_name)
+                if not client_facing:
+                    metadata.add_run("    Phase offset: ").bold = True
+                    metadata.add_run(
+                        format_value(offset, " s") if offset is not None else "—"
+                    )
 
-            method = document.add_paragraph()
-            method.add_run("Overall weighted correlation: ").bold = True
-            method.add_run(
-                f"{overall_text}. Pearson correlation is calculated per phase "
-                "from aligned samples. The configured weights express relative "
-                "trust in recorded points, not cycle counts. Comparison "
-                "differences are relative to the baseline reference. Amplitude "
-                "values are in pixels."
-            )
-            document.save(path)
+                if client_facing:
+                    document.add_heading("Results summary", level=2)
+                    document.add_paragraph(
+                        f"Results are presented for {len(report_sections)} "
+                        f"behavior phase(s), comparing {compare_name} with "
+                        f"{baseline_name}."
+                    )
+                    for label, rows, _, _ in report_sections:
+                        results = {
+                            metric: compare_value.split(" (Δ ", 1)[0]
+                            for metric, _, compare_value in rows
+                        }
+                        document.add_paragraph(
+                            f"{label}: mean peak-to-peak "
+                            f"{results['Mean pk-pk (px)']}; period "
+                            f"{results['Period (s)']}; cycles "
+                            f"{results['Number of cycles']}; correlation score "
+                            f"{results['Correlation score']}."
+                        )
+                    overall = document.add_paragraph()
+                    overall.add_run("Overall correlation score: ").bold = True
+                    overall.add_run(overall_text)
+
+                for label, rows, notes, phase_plot in report_sections:
+                    heading = document.add_heading(f"{label} table", level=2)
+                    heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    table = document.add_table(rows=1, cols=3)
+                    table.style = "Table Grid"
+                    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+                    table.autofit = True
+                    header_cells = table.rows[0].cells
+                    headers = (
+                        ("Measurement", "Baseline result", "Comparison result")
+                        if client_facing
+                        else ("Measurement differences", "Baseline", "Comparison")
+                    )
+                    for cell, text in zip(header_cells, headers):
+                        cell.text = text
+                        cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+                        for run in cell.paragraphs[0].runs:
+                            run.bold = True
+                        shading = OxmlElement("w:shd")
+                        shading.set(qn("w:fill"), "F2F2F2")
+                        cell._tc.get_or_add_tcPr().append(shading)
+
+                    for metric, baseline_value, compare_value in rows:
+                        if client_facing:
+                            compare_value = compare_value.split(" (Δ ", 1)[0]
+                        cells = table.add_row().cells
+                        for cell, text in zip(
+                            cells, (metric, baseline_value, compare_value)
+                        ):
+                            cell.text = str(text)
+                            cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+
+                    if phase_plot is not None:
+                        caption_text = (
+                            f"{label} waveform comparison"
+                            if client_facing
+                            else f"{label} waveform comparison "
+                            "(time shown relative to the start of each selected range)"
+                        )
+                        caption = document.add_paragraph(caption_text)
+                        caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                        document.add_picture(BytesIO(phase_plot), width=Inches(6.3))
+
+                    if not client_facing:
+                        notes_paragraph = document.add_paragraph()
+                        notes_paragraph.add_run(
+                            f"NSI quality assurance notes ({label}): "
+                        ).bold = True
+                        notes_paragraph.add_run(
+                            " ".join(notes) if notes else "____________________________"
+                        )
+
+                if not client_facing:
+                    method = document.add_paragraph()
+                    method.add_run("Overall weighted correlation: ").bold = True
+                    method.add_run(
+                        f"{overall_text}. Pearson correlation is calculated per phase "
+                        "from aligned samples. The configured weights express relative "
+                        "trust in recorded points, not cycle counts. Comparison "
+                        "differences are relative to the baseline reference. Amplitude "
+                        "values are in pixels."
+                    )
+
+            internal_document = Document()
+            add_report_content(internal_document, client_facing=False)
+            client_document = Document()
+            add_report_content(client_document, client_facing=True)
+            internal_document.save(path)
+            client_document.save(client_path)
         except OSError as exc:
             QMessageBox.warning(
                 self, "Export report table", f"Failed to save report:\n{exc}"
             )
             return
         QMessageBox.information(
-            self, "Export report table", f"Saved report table:\n{path}"
+            self,
+            "Export report table",
+            f"Saved reports:\n{path}\n{client_path}",
         )
 
     def _use_mm(self):
