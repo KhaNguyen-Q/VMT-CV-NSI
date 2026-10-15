@@ -46,6 +46,8 @@ python app/app.py
 
 In the comparison window, **Export report table** creates an internal NSI report and a client-facing report. The client report keeps the phase results and waveform plots, with a results summary, but omits calculation details and internal QA notes. It is saved beside the selected report with `_CLIENT` appended to the filename.
 
+For a plain-language explanation of the report's waveform correlation scores, see [Comparison report: understanding correlation](docs/ComparisonReportCorrelation.md).
+
 ## Object detection
 
 - **Tip Color (Red/Blue)** — tracks one translucent tip that is red and/or blue (dual HSV + area filter + track lock)

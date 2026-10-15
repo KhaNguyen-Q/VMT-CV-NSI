@@ -326,8 +326,18 @@ def _phase_waveform_figure(baseline, compare, ranges, offset, use_mm):
         (phase["end_s"] - phase["start_s"] for phase in ranges),
         default=1e-6,
     )
+    range_color_pairs = (
+        ("#1f77b4", "#ff7f0e"),
+        ("#2ca02c", "#d62728"),
+        ("#9467bd", "#8c564b"),
+        ("#e377c2", "#7f7f7f"),
+        ("#bcbd22", "#17becf"),
+    )
 
     for index, phase in enumerate(ranges, start=1):
+        baseline_color, compare_color = range_color_pairs[
+            (index - 1) % len(range_color_pairs)
+        ]
         start_s = phase["start_s"]
         end_s = phase["end_s"]
         duration = end_s - start_s
@@ -341,14 +351,14 @@ def _phase_waveform_figure(baseline, compare, ranges, offset, use_mm):
             overlay_axis.plot(
                 baseline_x,
                 baseline_y,
-                color="#168c83",
+                color=baseline_color,
                 linewidth=1.25,
                 label=f"Baseline — {label}",
             )
             baseline_axis.plot(
                 baseline_x,
                 baseline_y,
-                color="#168c83",
+                color=baseline_color,
                 linewidth=1.25,
                 label=label,
             )
@@ -365,7 +375,7 @@ def _phase_waveform_figure(baseline, compare, ranges, offset, use_mm):
                 overlay_axis.plot(
                     compare_x,
                     compare_y,
-                    color="#e47735",
+                    color=compare_color,
                     linewidth=1.15,
                     alpha=0.9,
                     label=f"Comparison — {label}",
@@ -373,7 +383,7 @@ def _phase_waveform_figure(baseline, compare, ranges, offset, use_mm):
                 compare_axis.plot(
                     compare_x,
                     compare_y,
-                    color="#e47735",
+                    color=compare_color,
                     linewidth=1.15,
                     label=label,
                 )
