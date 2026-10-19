@@ -1,323 +1,113 @@
-# Simple Harmonic Oscillator — Reference
+# Simple Harmonic Oscillator — User Guide
 
-This document is the in-repo guide for the **current** Harmonic-Oscillator-CV app after the spring/slider refactor and small-amplitude tooling discussed in development.
+This guide explains how to track a spring or slider in a video, read the results, and compare two runs. It is written for someone using the app, not for someone maintaining its code.
 
-## Purpose
+## What the app does
 
-Track **linear (1D) harmonic motion** from video and extract analytics:
+The app follows a visible point (usually a colored tip) as it moves in one direction:
 
-- **Slider / cart:** left–right → axis `x`
-- **Spring / mass:** up–down → axis `y`
-- Typical tip: translucent **red and/or blue** (dual HSV)
-- Useful when tip travel is **&lt; 1 cm**, if ROI + contrast + enough pixels of motion exist
+- A slider or cart moving left and right uses **Horizontal (x)**.
+- A spring or mass moving up and down uses **Vertical (y)**.
 
-It does **not** analyze pendulum swings (circular arcs, pivot, string length).
+It turns the video into a position-over-time graph and can estimate the motion's frequency and size. It is designed for straight-line motion, not pendulum swings.
 
-## What was removed (pendulum era)
+## Track a video
 
-| Removed | Reason |
-|---------|--------|
-| Circle fit of trajectory | Pendulum path is an arc; spring/slider path is a line |
-| Arc / rotated coordinates | Not needed for linear position |
-| Pivot / string overlays | Pendulum geometry |
-| \(L = g / \omega_0^2\) | Pendulum small-angle formula |
-| Blocking ~2000-frame pre-scan | Made “Loading %” extremely slow; equilibrium is now live |
+1. Open the app and choose a video, webcam, or video URL.
+2. Choose **Set ROI** and draw a box around the moving tip. Keep the whole path inside the box. The preview is resized when needed, but the selection is mapped back to the original video.
+3. Choose **Horizontal (x)** or **Vertical (y)** to match the direction of motion.
+4. Choose **Tip Color** and select **Red only**, **Blue only**, or **Both (red or blue)**.
+5. Change the display to **Mask**. Adjust the tip color sliders until the moving tip appears as one clear white shape and most of the background is black.
+6. Check that the app is following the correct tip in the video or contour view.
+7. Click **Run**. Let the video play through the part you want to measure, then click **Stop**.
+8. Click **Estimate** to calculate the motion results.
 
-## Idea → implementation
+For a small or hard-to-see movement, use a tight ROI and a clear, high-contrast tip. The tip should move enough pixels on screen for the app to distinguish its motion from tracking noise.
 
-**Idea:** Measure tip displacement vs time with classical CV (not a neural net), then fit an underdamped oscillator and/or FFT for frequency and amplitude.
+### If the app follows the wrong thing
 
-**Applied as:**
+- In **Mask**, adjust the color sliders until the tip is visible and other objects are not.
+- If background specks are detected, increase the minimum area; if the tip disappears, lower it again.
+- Try **Red only** or **Blue only** if another colored object is being followed.
+- Adjust the ROI so it contains the tip's full path but excludes distracting objects.
+- Stop and run the video again after changing the tracking setup.
 
-1. Decode video on a background `QThread`
-2. Detect tip (color / edge / circle)
-3. Subpixel centroid → 1D position series
-4. SciPy curve fit + NumPy FFT / peak-to-peak
-5. Optional mm scale via user `mm/pixel`
+## Understand the analysis
 
-```text
-Video / webcam / URL
-  → optional ROI (native resolution; no downscale inside ROI)
-  → tip color (red/blue HSV) | edge | Hough circle
-  → subpixel centroid (moments); Lucas–Kanade if mask drops briefly
-  → 1D position (x or flipped y)
-  → (time_s, position_px) + live equilibrium
-  → plot + Estimate (SHO fit, P2P, FFT) + Export CSV / Export Graph
-```
+The app offers two fit choices:
 
-Playback starts immediately (no warm-up pass). Without an ROI, wide frames may downscale to max width **640** for speed; **with an ROI, detection stays full crop resolution** (critical for sub-cm tips).
+- **Damped (underdamped)** allows the motion to get smaller over time. Use this for a spring or slider that gradually settles.
+- **Simple (undamped)** assumes the motion stays about the same size.
 
-## Libraries
+After tracking stops, choose the fit model and click **Estimate**. The analysis includes:
 
-| Library | Role |
-|---------|------|
-| **OpenCV (`cv2`)** | Video I/O, HSV/`inRange`, morphology, contours, Canny, Hough, Lucas–Kanade, ROI window, drawing |
-| **cvzone** | Contour helpers on masks |
-| **NumPy** | Arrays, moments support, FFT |
-| **SciPy** | `curve_fit` for the SHO model |
-| **PyQt5** | GUI, signals/slots, worker thread |
-| **pyqtgraph** | Live position / fit / decay plots |
-| **matplotlib** | Offline `test/damper_eqn_pred.py` only |
+- **Peak to Peak (P2P):** the full distance from the lowest tracked point to the highest. It is shown in pixels unless you enter a scale.
+- **Fit frequency:** the frequency estimated from the selected motion model.
+- **FFT frequency:** another frequency estimate, calculated from the repeated motion. Comparing it with the fit frequency can help spot an unreliable result.
+- **Period:** the estimated time for one complete back-and-forth cycle.
 
-This is **not** a black box: every tracking step is visible in `detector.py` / `video_thread.py`.
+These are estimates, not guarantees. A clean track over several cycles gives more useful results than a short, noisy, or interrupted track.
 
-## How displacement is tracked
+**Zero Y (mean)** re-centers the tracked positions around their average. Stop tracking before using it. It changes the displayed/analysed position baseline, not the video.
 
-### Primary path (Tip Color)
+**Peak to Peak** marks the tracked peaks and valleys. It can save a peak-to-peak CSV or image using the save dialogs.
 
-1. Blur → HSV  
-2. Dual ranges: **red** (wraps near hue 0/179) and/or **blue** (~95–130)  
-3. Morphology open/close  
-4. Contours filtered by `min_area` / `max_area`  
-5. Prefer blob near last tip center (temporal lock)  
-6. **Subpixel center** via image moments: \(c_x = m_{10}/m_{00}\), \(c_y = m_{01}/m_{00}\)
+### Use millimeters instead of pixels
 
-### Lucas–Kanade
+The app needs a scale to convert pixels to millimeters; it cannot work this out from the video resolution or camera distance alone. Find the **mm/pixel** control and enter a scale measured with the camera and object in the same positions as in your recording.
 
-`cv2.calcOpticalFlowPyrLK` is used as a **short fallback** when the color mask fails (~15 frames), then reset. It is **not** the primary measurement path today. Color + moments is usually better for a colored translucent tip; LK-as-primary would need a textured marker.
+One way to get a scale is to move the tracked point between two known positions. For example, moving it from **−1 cm to +1 cm** is a total movement of **20 mm**. If the tracked position changes by 100 pixels between those points, enter **0.2 mm/pixel** (20 mm ÷ 100 pixels). Keep the camera distance and object position unchanged when using that scale.
 
-### Axis / position definition
+With a valid scale, the app can show results in millimeters. If the scale is zero or unknown, use the pixel results instead. A displayed **Tip L** measurement can also help when the visible tip has a known physical length; use its full-frame measurement, not the smaller detection-preview size.
 
-| UI | Stored | Position |
-|----|--------|----------|
-| Horizontal (x) | `x` | \(c_x\) (pixels from left) |
-| Vertical (y) | `y` | \(H - c_y\) (up positive) |
+### Export a graph or tracking data
 
-### Time definition (important)
+- **Export CSV** saves the tracked position and time values. Use the save dialog to choose the file name and location.
+- **Export Graph** saves a displacement-versus-time image. It requires a successful estimate and a non-zero **mm/pixel** scale. Use its **Start** and **End** controls to export a time interval if needed.
+- **Estimate** also saves estimate data as a CSV.
 
-\[
-t_{\mathrm{sec}} = \texttt{time\_scale} \times \frac{\text{frame index}}{\texttt{CAP\_PROP\_FPS}}
-\]
+The app suggests file names and locations, but the save dialog lets you choose where to put each file.
 
-(with a fallback FPS of 30 if metadata is missing). **Time scale** defaults to `1.0` (file metadata time). For remapped / slo-mo exports whose file duration differs from the original playback length, set:
+## Compare two runs
 
-\[
-\texttt{time\_scale} = \frac{\text{original duration}}{\text{file duration}}
-\]
+The comparison window lets you line up a baseline run with another run and compare selected parts of their motion.
 
-Example: original playback \(72.5\,\mathrm{s}\), converted file \(39.5\,\mathrm{s}\) → `time_scale ≈ 1.8354`. That stretches the plot, CSV, and fits onto the original timeline.
+1. In the main window, open **Compare…**.
+2. Choose **Load baseline CSV…** and load the first run's tracking CSV.
+3. Choose **Load compare CSV…** and load the second run's tracking CSV.
+4. If you have the baseline's **Peak to Peak** CSV, choose **Load baseline peak-to-peak CSV…** as well. This is optional, but provides tagged peak information for the comparison.
+5. Review the overlaid graph. The app estimates how to line up the two runs; adjust **Phase offset (s)** if the traces need to move earlier or later relative to each other.
+6. Select a behavior range on the baseline graph by dragging across the desired time interval.
+7. Choose or enter a **Baseline behavior**, set **Expected cycles** if needed, and optionally select **Smooth this range**. Click **Add selected baseline range**. Ranges cannot overlap.
+8. Repeat for other ranges you want to compare.
 
-**Caveat:** scaled time changes fitted/FFT frequency by the same factor. Use `1.0` when file FPS already matches real acquisition time.
+If tagged baseline peaks are available, an **Expected cycles** value of 0 uses their cycle count. A compare run is needed for statistics between two runs; some baseline range exports can be made with only the baseline loaded.
 
-**CFR assumption only.** Variable frame rate (common on phone “4K 60fps” when the device throttles) is **not** handled. `CAP_PROP_POS_MSEC` is *not* used yet; even that is backend-dependent and not a guarantee for all `.MOV`s. For trustworthy Hz from smartphone clips:
+## Comparison exports
 
-- Prefer **re-encode to constant frame rate (CFR)**, e.g.  
-  `ffmpeg -i input.MOV -vsync cfr -r 60 -c:v libx264 -crf 18 -an out_cfr.mp4`  
-- Or add PTS / robust timestamping later
+- **Export ranges CSV…** saves the configured ranges and available baseline/compare measurements.
+- **Save outliers CSV…** saves the comparison findings and their severity labels.
+- **Save smoothed baseline CSV…** saves the original and smoothed baseline data when a range uses smoothing.
+- **Export report table…** creates an internal Word report and a client-facing Word report. The client file is saved beside the selected report with **_CLIENT** added to its name.
 
-“4K 60fps” on a phone is a **target mode**, not a promise that every frame is exactly \(1/60\) s apart (heat, low light, HDR, etc.).
+Use the save dialogs to select the destination. The client report is designed to show results without the internal calculation details and QA notes.
 
-## Display modes (view only — tracking unchanged)
+For a plain-language explanation of the report's waveform correlation scores, see [Comparison report: understanding correlation](ComparisonReportCorrelation.md).
 
-| Mode | Shows | Use for |
-|------|--------|---------|
-| **Main Video** | Raw frames + overlays | Framing / overlays on the real tip |
-| **Image Contours** | Tip marker + `tip (x,y) a=…` | Confirm which blob is locked |
-| **Mask** | Binary detection mask | Tune HSV (`smin`, area, Red/Blue) |
+## Tips for more reliable results
 
-Workflow: tune on **Mask** → verify on **Image Contours** / **Main Video**.
-
-## Plot series: Actual, Visual gain, Fitted, Decay
-
-| Series | Meaning | Measurement? |
-|--------|---------|----------------|
-| **Actual Position** | Tracked \(x(t)\) in pixels | Yes |
-| **Visual gain** | \(x_{\mathrm{vis}} = \bar x + G(x-\bar x)\) (dashed plot + orange overlay) | **No** — display only |
-| **Fitted curve** | SHO model \(A e^{-\gamma t}\cos(\omega t+\phi)+C\) after **Estimate** | Yes (parameters) |
-| **Decay curve** | Envelopes \(C \pm A e^{-\gamma t}\) | Derived from fit |
-
-Fitted model:
-
-\[
-x(t) = A\,e^{-\gamma t}\cos(\omega t + \phi) + C
-\]
-
-Derived after Estimate:
-
-| Quantity | Formula |
-|----------|---------|
-| Period \(T\) | \(2\pi / \omega\) |
-| Fit frequency \(f\) | \(\omega / 2\pi\) (Hz) |
-| \(\omega_0\) | \(\sqrt{\omega^2 + \gamma^2}\) |
-| \(k/m\) | \(\omega_0^2\) (mass–spring assumption) |
-| **P2P (px)** | \(\max(x)-\min(x)\) over tracked samples |
-| **FFT f** | Dominant FFT peak (Hz), cross-check vs fit \(f\) |
-
-Example: P2P **32** means **32 pixels** peak-to-peak — usable for CV (far better than ~2–3 px). Physical mm requires calibration (below).
-
-## Pixels → millimeters
-
-The app does **not** infer mm from “4K” or camera distance.
-
-\[
-\mathrm{mm} = \mathrm{pixels} \times (\mathrm{mm/pixel})
-\]
-
-**Option A — ruler**
-
-1. Place a ruler in the **tip plane** (same depth as the tip).  
-2. Measure a known length in mm and in pixels.  
-3. \(\mathrm{mm/pixel} = \mathrm{known\ mm} / \mathrm{pixel\ span}\).  
-4. Enter that in the **mm/pixel** spin box → P2P (mm), A (mm), CSV `position_mm`.
-
-**Option B — known tip length + Mask Tip L (px)**
-
-1. Tune **HSV** in Mask view until the white blob matches the tip end-to-end.  
-2. Watch **Tip L (px)** update live (overlay `L=… px (full)`; detect `WxH` is display-only).  
-3. \(\mathrm{mm/pixel} = \mathrm{tip\ length\ (mm)} / \mathrm{Tip\ L\ (px)}\).  
-4. Enter **mm/pixel**, then Estimate / Export.
-
-**Tip L coordinate system**
-
-- **Tip L** and tracked **displacement** are both in **full-frame pixels** (same space), so `mm/pixel = tip_mm / Tip_L` matches `x_px` / `y_px`.  
-- Detect runs at Mask resolution (≤ 640 wide without ROI, or native ROI); values are scaled by Frame W/H (or actual size) to full-frame.  
-- Overlay secondary line `WxH detect  L=…` is **display only** — explains Mask blob size; do not use it for mm calibration.  
-- **Empty mask clears Tip L**. Re-tune HSV until Tip L (full) is live before calibrating.  
-- Tight **ROI** keeps native detect resolution (best spatial detail).
-
-If mm/pixel is **0**, mm fields stay blank; analysis stays in pixels.
-
-**Rough FOV estimate only** (not for reporting): at ~1 inch distance, 4K landscape (~3840 px wide), mm/pixel often lands around ~0.005–0.015 depending on lens FOV — always prefer a ruler or known tip length.
-
-## Tip color controls
-
-- Mode: **Both (red or blue)** / **Red only** / **Blue only**  
-- Shared **smin/smax/vmin/vmax** (translucent tips often need lower `smin`)  
-- **min_area / max_area** — raise min_area to reject noise; lower max_area to avoid huge background floods  
-- **Save Tip HSV** → `data/json/hsv.json`  
-- One HSV band cannot cover red and blue unless dual ranges (already implemented)
-
-## ROI
-
-- **Set ROI** opens OpenCV `selectROI` on the **first full-resolution frame**.  
-- On 4K phone video the window can look “zoomed” so the tip is hard to frame — known UX limitation (preview is not downscaled).  
-- Workarounds: use a pre-cropped clip (e.g. `Crop.mp4`), or **Clear ROI** and run full-frame (worse for tiny motion).  
-- Desired fix (not necessarily shipped): scale preview for picking, map rectangle back to full-res coordinates.
-
-## Runtime memory and run-to-run differences
-
-### Cleared on each Run
-
-- `data_points` and plot curves  
-- New `VideoThread` / detector (tip lock / LK state reset)
-
-### Persists in the session (until changed / app restart)
-
-| State | Notes |
-|-------|--------|
-| ROI | Until **Clear ROI** |
-| HSV sliders | In memory; disk if you Saved |
-| Axis, mask mode, visual gain, mm/pixel | UI knobs |
-| Last **Estimate** labels | Stale until you Estimate again |
-| Equilibrium readout | Updated live; not a full UI wipe |
-
-### Why the “same” video can look drastically different
-
-1. Stopped early vs full clip → different series length  
-2. First locked blob can differ if several red/blue regions exist  
-3. HSV tweaked during a previous run still applies  
-4. ROI on vs off / different box  
-5. Lost lock / LK gaps → different \(x(t)\)  
-6. `curve_fit` is sensitive to noisy or partial data  
-
-**For repeatable runs:** fix ROI, don’t touch HSV mid-run, let the clip finish (or always stop at the same time), verify Mask shows one tip, then Estimate. Restart the app for a clean slate.
-
-Also: repeated Run can accumulate HSV signal connections to old threads (messy); restart if behavior feels haunted.
-
-## Overlays
-
-- Cyan rectangle = ROI  
-- Red/cyan = tracked tip  
-- Green = equilibrium line  
-- Orange = visual-gain tip offset (**not** the measurement)
-
-## Export / saved files
-
-| Path | Contents |
-|------|----------|
-| `data/json/hsv.json` | Tip HSV + area limits |
-| `data/json/parameters.json` | Last saved fit (+ mm/pixel if saved) |
-| `data/csv/estimate_x.csv` or `estimate_y.csv` | Written on **Estimate**: `time_s`, `x_px`/`y_px`, `x_mm`/`y_mm` |
-| `data/csv/tracked_tip_x.csv` or `tracked_tip_y.csv` | Manual **Export CSV** (same columns) |
-| `data/plots/displacement_vs_time_x.png` (or `_y`) | **Export Graph**: Displacement (mm) vs Time (s) |
-| User-selected CSV path | In the Compare window, **Export ranges CSV…** saves baseline and aligned compare statistics per selected behavior range, including time coverage, cycle counts, P2P mean/std and deltas, periods, cycle settings, and smoothing. Compare intervals are mapped using the current phase offset; unavailable measurements are blank. |
-
-For smoothed **Phase 1** ranges, the redraw matches the mean adjacent-extrema
-peak-to-peak amplitude from the loaded tagged extrema; range edges blend back
-to the original signal.
-
-In the Compare window, yellow **Review** markers show point residuals above
-25% of the local baseline span (with a 7.5% overall-span floor). Red **Strong
-outlier** markers require a larger residual, above 40% of the local span (with
-a 15% overall-span floor), sustained for at least 50 ms. These thresholds use
-the raw baseline motion and compare run's residuals against it, rather than the
-smoothed display curve or the residual spread, so smoothing does not create
-point flags and a more different comparison cannot inflate its own cutoff.
-Phase cycle-count differences of one are review flags; larger differences are
-strong. Peak-to-peak
-findings have review and strong thresholds, with the sensitivity control setting
-the strong threshold in standard deviations. The exported outliers CSV records
-the severity in its `tag` column (`review` or `strong_outlier`).
-
-**Export Graph** (matplotlib) is enabled only after **mm/pixel > 0** and a successful **Estimate**. It plots the tracked series in mm with padded auto-limits so peaks are visible. Plot styling lives in `app/utils/plot_export.py`.
-
-## Recommended workflow (small tip)
-
-1. Prefer short, cool, well-lit clips; consider **CFR re-encode** for phone 4K60.  
-2. High-contrast marker on translucent tip if Mask is unstable.  
-3. Ruler in tip plane → set **mm/pixel**.  
-4. **Set ROI** tightly (or use a pre-cropped video).  
-5. **Tip Color** + **Mask** → tune until one clean white blob.  
-6. Confirm **Frame W / H** (auto-filled; drives detect→full Tip L / position scale).  
-7. **Run** → **Stop** → **Estimate** (also writes `estimate_x.csv` / `estimate_y.csv`) → compare Fit f vs FFT f → optional **Export CSV** / **Export Graph**.
-8. Use **Visual gain** only to *see* small motion; ignore it for reported amplitude.
-
-## Hardware (not code)
-
-1. Opaque high-contrast tip marker  
-2. Fill the frame with the tip (maximize px/mm)  
-3. Fixed camera; scale in tip plane  
-4. Optical lever only if P2P stays ~2–3 px after the above  
-
-## Key files
-
-| File | Role |
-|------|------|
-| `app/app.py` | Entry point |
-| `app/processing/detector.py` | Tip mask, subpixel centroid, LK fallback |
-| `app/processing/video_thread.py` | ROI, tracking loop, timebase, CSV helper |
-| `app/windows/app_window.py` | GUI, ROI, plot, fit, export |
-| `app/windows/analyze_widget.py` | Metrics, mm/pixel, visual gain, Export Graph |
-| `app/windows/hsv_slider.py` | Tip color / area UI |
-| `app/utils/utils.py` | SHO model, FFT, P2P, JSON |
-| `app/utils/plot_export.py` | Matplotlib Displacement vs Time PNG export |
-| `requirements.txt` | Flexible pins (Python 3.10+, including 3.14) |
-
-## Python / install
+- Keep the camera still and the moving tip in focus.
+- Use good lighting and a clear marker that stands out from the background.
+- Make sure the tip moves far enough on screen to be tracked clearly.
+- Keep the ROI and slider settings the same when repeating a run.
+- Use **Mask** to check that the app sees one tip, not several blobs.
+- Let the recording run for the same amount of time when comparing trials.
+- Phone videos recorded at a variable frame rate or exported in slow motion may give unreliable timing and frequency. For the most reliable timing, use a constant-frame-rate video and check that its playback speed matches the real motion.
+
+## Set up the app
+
+For installation instructions, see the project [README](../README.md). Once the app and its requirements are installed, start it from the project folder with:
 
 ```bash
-cd Harmonic-Oscillator-CV   # project root (not a parent folder like PRODocc alone)
-python -m venv venv
-venv\Scripts\activate          # Windows
-pip install -r requirements.txt
 python app/app.py
 ```
-
-Use the **flexible** `requirements.txt` (`numpy>=2.0`, etc.). Old exact pins (`numpy==1.25.2`, `contourpy==1.1.0`, …) fail on Python 3.14 (no wheels / source build errors).
-
-If you keep a second copy under another folder, sync `app/` and `requirements.txt` from this tree — stale copies lack ROI / tip / analytics updates.
-
-## Possible improvements (backlog)
-
-1. ROI preview scaled to screen, map box back to full-res (fix 4K “zoom” UX)  
-2. Prefer `CAP_PROP_POS_MSEC` when monotone/sane, else `frame/fps`; or CFR preprocess docs in UI  
-3. Optional **LK / template as primary** tracker mode  
-4. Click-two-points calibration for mm/pixel  
-5. Disconnect old thread signals each Run; reset Analyze labels on Run  
-6. Fit R² / covariance; allow Estimate on paused data with clearer messaging  
-7. Process every frame at 60 FPS when ROI is small  
-8. Offline CLI analyzer for batch videos  
-
-## Related docs
-
-- [README.md](../README.md) — quick start and usage checklist  
