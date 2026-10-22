@@ -935,15 +935,6 @@ class AppWindow(QWidget):
             if csv_path:
                 write_peak_to_peak_csv(csv_path, rows)
 
-            png_path = self._choose_save_path(
-                "Save peak-to-peak graph",
-                os.path.join(project_root, "data", "plots"),
-                f"peak_to_peak_{axis}.png",
-                "PNG images (*.png);;All files (*)",
-                ".png",
-            )
-            if png_path:
-                export_peak_to_peak_plot(png_path, t, y_px, rows, axis=axis)
         except Exception as exc:
             QMessageBox.warning(
                 self, "Peak to Peak", f"Failed to compute peak-to-peak:\n{exc}"

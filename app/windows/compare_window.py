@@ -43,6 +43,7 @@ from utils.utils import (
 from windows.graph_viewbox import GraphViewBox
 
 _project_root = get_project_root(os.path.dirname(os.path.abspath(__file__)))
+_PX_TO_MM = 1.0 / 10.0
 
 
 def _read_tracking_csv(path):
@@ -167,6 +168,7 @@ def _peak_to_peak_stats(extrema, start_s, end_s):
         "rows": rows,
         "cycle_count": min(top_count, bottom_count),
         "sample_count": int(amplitudes.size),
+        "amplitudes": amplitudes.tolist(),
         "mean": float(np.mean(amplitudes)) if amplitudes.size else None,
         "std": (
             float(np.std(amplitudes, ddof=1 if amplitudes.size > 1 else 0))
@@ -187,6 +189,7 @@ def _cycle_period_stats(extrema, start_s, end_s):
     )
     periods = np.diff(peak_times)
     return {
+        "periods": periods.tolist(),
         "mean": float(np.mean(periods)) if periods.size else None,
         "std": (
             float(np.std(periods, ddof=1 if periods.size > 1 else 0))
@@ -195,6 +198,251 @@ def _cycle_period_stats(extrema, start_s, end_s):
         ),
         "sample_count": int(periods.size),
     }
+
+
+def _detected_extrema(series):
+    mask = np.isfinite(series["time_s"]) & np.isfinite(series["px"])
+    times = series["time_s"][mask]
+    positions = series["px"][mask]
+    if times.size < 3:
+        return None
+    rows = find_peak_to_peak_extrema(times, positions)
+    if not rows:
+        return None
+    return {
+        "name": f"{series['name']} (detected)",
+        "path": series["path"],
+        "rows": rows,
+    }
+
+
+def _evaluate_cycle_checks(phase_key, cycle_checks):
+    baseline_counts = [
+        check["baseline"]
+        for check in cycle_checks
+        if check["baseline"] is not None
+    ]
+    phase2_mean = (
+        float(np.mean(baseline_counts))
+        if phase_key == "phase_2" and baseline_counts
+        else None
+    )
+    phase2_std = (
+        float(np.std(baseline_counts, ddof=1))
+        if phase_key == "phase_2" and len(baseline_counts) >= 2
+        else None
+    )
+    results = []
+    for check in cycle_checks:
+        result = {
+            "check": check,
+            "status": "INCONCLUSIVE",
+            "expected": None,
+            "difference": None,
+            "deviations": None,
+            "baseline_mean": phase2_mean,
+            "baseline_std": phase2_std,
+        }
+        observed = check["observed"]
+        if phase_key == "phase_1":
+            expected = check["expected"]
+            result["expected"] = expected
+            if expected is not None and observed is not None:
+                result["difference"] = abs(observed - expected)
+                result["status"] = (
+                    "REVIEW" if result["difference"] >= 2 else "PASS"
+                )
+        elif phase_key == "phase_2":
+            if phase2_mean is not None and phase2_std is not None:
+                if observed is not None:
+                    difference = abs(observed - phase2_mean)
+                    deviations = (
+                        0.0
+                        if difference == 0
+                        else float("inf")
+                        if phase2_std == 0
+                        else difference / phase2_std
+                    )
+                    result["difference"] = difference
+                    result["deviations"] = deviations
+                    result["status"] = (
+                        "FAIL"
+                        if difference >= 20
+                        else "REVIEW"
+                        if deviations > 2
+                        else "PASS"
+                    )
+            if check["baseline"] is None:
+                result["status"] = "INCONCLUSIVE"
+        results.append(result)
+
+    unresolved = []
+    if phase_key == "phase_2" and len(baseline_counts) < 2:
+        unresolved.append(
+            "Phase 2 cycle counts: at least two selected baseline ranges are "
+            "needed to calculate the baseline mean and sample standard deviation."
+        )
+    for result in results:
+        check = result["check"]
+        if phase_key == "phase_1" and result["expected"] is None:
+            unresolved.append(
+                f"Phase 1 range {check['start_s']:.3f}-{check['end_s']:.3f} s: "
+                "could not determine the expected cycle count."
+            )
+        elif check["observed"] is None:
+            unresolved.append(
+                f"{phase_key.replace('_', ' ').title()} range "
+                f"{check['start_s']:.3f}-{check['end_s']:.3f} s: "
+                "could not determine the comparison cycle count."
+            )
+        if phase_key == "phase_2" and check["baseline"] is None:
+            unresolved.append(
+                f"Phase 2 range {check['start_s']:.3f}-{check['end_s']:.3f} s: "
+                "could not determine the baseline cycle count."
+            )
+    return results, unresolved
+
+
+def _assess_baseline_specifications(
+    phase_data, compare_loaded, sigma=3.0
+):
+    failures = []
+    reviews = []
+    unresolved = []
+    if not compare_loaded:
+        return "INCONCLUSIVE", ["Comparison tracking data was not loaded."]
+
+    for label, data in phase_data.items():
+        _phase_key, weight = _phase_weight(label)
+        if weight <= 0:
+            continue
+        cycle_checks = data["cycle_checks"]
+        cycle_results, cycle_unresolved = _evaluate_cycle_checks(
+            _phase_key, cycle_checks
+        )
+        unresolved.extend(cycle_unresolved)
+        for result in cycle_results:
+            check = result["check"]
+            observed = check["observed"]
+            if _phase_key == "phase_1" and result["expected"] is not None:
+                if observed is None:
+                    continue
+                cycle_detail = (
+                    f"{label} range {check['start_s']:.3f}-{check['end_s']:.3f} s: "
+                    f"{observed} comparison cycles vs expected "
+                    f"{result['expected']} (difference "
+                    f"{result['difference']})."
+                )
+            elif (
+                _phase_key == "phase_2"
+                and result["baseline_mean"] is not None
+                and observed is not None
+            ):
+                cycle_detail = (
+                    f"{label} range {check['start_s']:.3f}-{check['end_s']:.3f} s: "
+                    f"{observed} comparison cycles; baseline mean "
+                    f"{result['baseline_mean']:.3g}, SD "
+                    f"{result['baseline_std']:.3g}; difference "
+                    f"{result['difference']:.2f} cycles "
+                    f"({result['deviations']:.2f} SD)."
+                )
+                if result["status"] == "FAIL":
+                    cycle_detail += " Phase 2 cycle-count difference of at least 20 fails."
+            else:
+                continue
+
+            if result["status"] == "FAIL":
+                failures.append(cycle_detail)
+            elif result["status"] == "REVIEW":
+                reviews.append(cycle_detail)
+
+        for metric, unit, baseline_values, compare_values in (
+            (
+                "peak-to-peak amplitude",
+                "px",
+                data["baseline_amplitudes"],
+                data["compare_amplitudes"],
+            ),
+            (
+                "period",
+                "s",
+                data["baseline_periods"],
+                data["compare_periods"],
+            ),
+        ):
+            if len(baseline_values) < 2:
+                unresolved.append(
+                    f"{label} {metric}: at least two baseline measurements are "
+                    "needed to calculate a standard deviation."
+                )
+                continue
+            if not compare_values:
+                unresolved.append(
+                    f"{label} {metric}: no comparison measurements were available."
+                )
+                continue
+
+            baseline_mean = float(np.mean(baseline_values))
+            baseline_std = float(np.std(baseline_values, ddof=1))
+            compare_mean = float(np.mean(compare_values))
+            lower = baseline_mean - sigma * baseline_std
+            upper = baseline_mean + sigma * baseline_std
+            metric_detail = (
+                f"{label} mean {metric}: comparison {compare_mean:.4g} {unit}; "
+                f"allowed {lower:.4g} to {upper:.4g} {unit} based on baseline "
+                f"mean {baseline_mean:.4g}, SD {baseline_std:.4g}, "
+                f"n={len(baseline_values)}."
+            )
+            if compare_mean < lower or compare_mean > upper:
+                failures.append(metric_detail)
+
+        if data["coverage_incomplete"]:
+            unresolved.append(
+                f"{label} comparison coverage does not span all selected ranges."
+            )
+
+    if not any(_phase_weight(label)[1] > 0 for label in phase_data):
+        unresolved.append(
+            "No Phase 1 or Phase 2 ranges were selected for assessment."
+        )
+
+    if failures:
+        return "FAIL", failures
+    if unresolved:
+        return "INCONCLUSIVE", reviews + unresolved
+    if reviews:
+        return "REVIEW", reviews
+    return "PASS", [_client_assessment_description("PASS")]
+
+
+def _client_assessment_description(assessment):
+    descriptions = {
+        "PASS": (
+            "The quality assurance results indicate that the SONIK device is "
+            "working as intended. The observed performance was consistent with "
+            "the expected behavior for the selected tests."
+        ),
+        "REVIEW": (
+            "The results are satisfactory overall, although some observations "
+            "may benefit from additional review. Please contact NSI for more "
+            "information."
+        ),
+        "FAIL": (
+            "The results indicate that the device is non-conforming with one or "
+            "more expected performance criteria. Please contact NSI to discuss "
+            "the findings."
+        ),
+        "INCONCLUSIVE": (
+            "The available results were not sufficient to determine device "
+            "performance. Please ensure the test instructions were followed "
+            "thoroughly, then contact NSI for more information."
+        ),
+    }
+    return descriptions.get(
+        assessment,
+        "The available results could not be interpreted. Please contact NSI "
+        "for more information.",
+    )
 
 
 def _to_float(value):
@@ -304,16 +552,38 @@ def _relative_difference_pct(difference, baseline):
     return 100.0 * difference / abs(baseline)
 
 
-def _phase_waveform_figure(baseline, compare, ranges, offset, use_mm):
+def _phase_waveform_figure(
+    baseline,
+    compare,
+    ranges,
+    offset,
+    use_mm,
+    client_facing=False,
+    px_to_mm=False,
+):
     """Render each selected range against baseline-relative elapsed time."""
     if baseline is None:
         return None
 
-    unit = "mm" if use_mm else "px"
-    baseline_times, baseline_values, _ = _series_position(baseline, use_mm)
+    if px_to_mm:
+        unit = "mm"
+
+        def position(series):
+            if np.isfinite(series["px"]).any():
+                times, values, _ = _series_position(series, False)
+                return times, values * _PX_TO_MM, None
+            return _series_position(series, True)
+
+    else:
+        unit = "mm" if use_mm else "px"
+
+        def position(series):
+            return _series_position(series, use_mm)
+
+    baseline_times, baseline_values, _ = position(baseline)
     compare_data = None
     if compare is not None:
-        compare_times, compare_values, _ = _series_position(compare, use_mm)
+        compare_times, compare_values, _ = position(compare)
         compare_data = (compare_times, compare_values)
 
     figure = Figure(figsize=(9, 6.6), constrained_layout=True)
@@ -341,7 +611,11 @@ def _phase_waveform_figure(baseline, compare, ranges, offset, use_mm):
         start_s = phase["start_s"]
         end_s = phase["end_s"]
         duration = end_s - start_s
-        label = f"Range {index} ({start_s:.3f}–{end_s:.3f} s)"
+        label = (
+            "Selected range"
+            if client_facing
+            else f"Range {index} ({start_s:.3f}–{end_s:.3f} s)"
+        )
         baseline_mask = (
             (baseline_times >= start_s) & (baseline_times <= end_s)
         )
@@ -392,23 +666,45 @@ def _phase_waveform_figure(baseline, compare, ranges, offset, use_mm):
         axis.set_xlim(0, max(max_duration, 1e-6))
 
     overlay_axis.set_title("Waveform overlay")
-    overlay_axis.set_ylabel(f"Displacement ({unit}, mean-subtracted)")
-    overlay_axis.grid(True, alpha=0.25)
-    overlay_axis.legend(loc="best", fontsize="small")
+    axis_label = (
+        f"Displacement ({unit})"
+        if px_to_mm
+        else "Relative displacement"
+        if client_facing
+        else f"Displacement ({unit}, mean-subtracted)"
+    )
+    overlay_axis.set_ylabel(axis_label)
+    if client_facing:
+        overlay_axis.grid(False)
+    else:
+        overlay_axis.grid(True, alpha=0.25)
+    if not client_facing:
+        overlay_axis.legend(loc="best", fontsize="small")
 
     baseline_axis.set_title("Baseline")
-    baseline_axis.set_ylabel(f"Displacement ({unit}, mean-subtracted)")
-    baseline_axis.set_xlabel("Elapsed time from range start (s)")
-    baseline_axis.grid(True, alpha=0.25)
-    if baseline_axis.lines:
+    baseline_axis.set_ylabel(axis_label)
+    baseline_axis.set_xlabel(
+        "Relative time" if client_facing else "Elapsed time from range start (s)"
+    )
+    if client_facing:
+        baseline_axis.grid(False)
+    else:
+        baseline_axis.grid(True, alpha=0.25)
+    if baseline_axis.lines and not client_facing:
         baseline_axis.legend(loc="best", fontsize="small")
 
     compare_axis.set_title("Comparison")
-    compare_axis.set_ylabel(f"Displacement ({unit}, mean-subtracted)")
-    compare_axis.set_xlabel("Elapsed time from range start (s)")
-    compare_axis.grid(True, alpha=0.25)
+    compare_axis.set_ylabel(axis_label)
+    compare_axis.set_xlabel(
+        "Relative time" if client_facing else "Elapsed time from range start (s)"
+    )
+    if client_facing:
+        compare_axis.grid(False)
+    else:
+        compare_axis.grid(True, alpha=0.25)
     if compare_axis.lines:
-        compare_axis.legend(loc="best", fontsize="small")
+        if not client_facing:
+            compare_axis.legend(loc="best", fontsize="small")
     else:
         compare_axis.text(
             0.5,
@@ -419,12 +715,98 @@ def _phase_waveform_figure(baseline, compare, ranges, offset, use_mm):
             transform=compare_axis.transAxes,
         )
 
+    if client_facing and not px_to_mm:
+        for axis in (overlay_axis, baseline_axis, compare_axis):
+            axis.set_xticks([])
+            axis.set_yticks([])
+    elif client_facing:
+        for axis in (overlay_axis, baseline_axis, compare_axis):
+            axis.set_xticks([])
+
     figure.suptitle("Selected-range waveform comparison")
     output = BytesIO()
     canvas.print_png(output)
     figure.clear()
     output.seek(0)
     return output
+
+
+def _phase_boxplot_figure(
+    label,
+    baseline_amplitudes,
+    compare_amplitudes,
+    baseline_periods,
+    compare_periods,
+):
+    figure = Figure(figsize=(7.2, 3.2), constrained_layout=True)
+    canvas = FigureCanvasAgg(figure)
+    amplitude_axis, period_axis = figure.subplots(1, 2)
+
+    for axis, title, baseline_values, compare_values, unit in (
+        (
+            amplitude_axis,
+            "Peak-to-peak amplitude",
+            baseline_amplitudes,
+            compare_amplitudes,
+            "px",
+        ),
+        (period_axis, "Cycle period", baseline_periods, compare_periods, "s"),
+    ):
+        groups = []
+        labels = []
+        for series_label, values in (
+            ("Baseline", baseline_values),
+            ("Comparison", compare_values),
+        ):
+            values = np.asarray(values, dtype=float)
+            values = values[np.isfinite(values)]
+            if values.size:
+                groups.append(values)
+                labels.append(series_label)
+        axis.set_title(title)
+        axis.set_ylabel(unit)
+        axis.grid(axis="y", alpha=0.25)
+        if groups:
+            axis.boxplot(
+                groups,
+                tick_labels=labels,
+                showmeans=True,
+                flierprops={
+                    "marker": "o",
+                    "markerfacecolor": "none",
+                    "markersize": 4,
+                },
+            )
+        else:
+            axis.text(
+                0.5,
+                0.5,
+                "Measurements unavailable",
+                ha="center",
+                va="center",
+                transform=axis.transAxes,
+            )
+
+    figure.suptitle(f"{label}: measurement distributions")
+    output = BytesIO()
+    canvas.print_png(output)
+    figure.clear()
+    output.seek(0)
+    return output
+
+
+def _boxplot_outlier_count(values):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if not values.size:
+        return None
+    if values.size < 2:
+        return 0
+    lower_quartile, upper_quartile = np.percentile(values, [25, 75])
+    iqr = upper_quartile - lower_quartile
+    lower_fence = lower_quartile - 1.5 * iqr
+    upper_fence = upper_quartile + 1.5 * iqr
+    return int(np.count_nonzero((values < lower_fence) | (values > upper_fence)))
 
 
 def _odd_window(length, fraction):
@@ -659,8 +1041,29 @@ def behavior_outliers(
     baseline_extrema=None,
     n_sigmas=3.0,
 ):
-    """Compare each range against tagged baseline peak-to-peak statistics."""
+    """Compare each range with baseline extrema and configured expectations."""
     findings = []
+    phase2_baseline_counts = [
+        _peak_to_peak_stats(baseline_extrema, phase["start_s"], phase["end_s"])[
+            "cycle_count"
+        ]
+        for phase in phase_ranges
+        if baseline_extrema is not None
+        and _phase_weight(phase["label"])[0] == "phase_2"
+    ]
+    phase2_baseline_counts = [
+        count for count in phase2_baseline_counts if count is not None
+    ]
+    phase2_mean = (
+        float(np.mean(phase2_baseline_counts))
+        if phase2_baseline_counts
+        else None
+    )
+    phase2_std = (
+        float(np.std(phase2_baseline_counts, ddof=1))
+        if len(phase2_baseline_counts) >= 2
+        else None
+    )
     for phase in phase_ranges:
         start = phase["start_s"]
         end = phase["end_s"]
@@ -682,55 +1085,68 @@ def behavior_outliers(
             sum(row["label"] == "bottom" for row in compare_extrema),
         )
         expected_cycles = phase["expected_cycles"] or baseline_cycles
+        phase_key, _weight = _phase_weight(phase["label"])
 
-        if phase["expected_cycles"] and baseline_cycles and (
-            baseline_cycles != phase["expected_cycles"]
+        cycle_expectation = expected_cycles
+        cycle_difference = None
+        if phase_key == "phase_1" and expected_cycles is not None:
+            cycle_difference = abs(compare_cycles - expected_cycles)
+            cycle_mismatch = cycle_difference >= 2
+        elif (
+            phase_key == "phase_2"
+            and phase2_mean is not None
+            and phase2_std is not None
         ):
-            difference = abs(baseline_cycles - phase["expected_cycles"])
-            findings.append(
-                {
-                    "finding_type": "baseline_cycle_count",
-                    "phase": phase["label"],
-                    "time_s": start,
-                    "expected": phase["expected_cycles"],
-                    "observed": baseline_cycles,
-                    "ratio": "",
-                    "baseline_pos": "",
-                    "compare_pos": "",
-                    "residual": "",
-                    "tag": "strong_outlier" if difference > 1 else "review",
-                    "details": (
-                        f"Selected baseline range contains {baseline_cycles} "
-                        f"complete cycles; configured expectation is "
-                        f"{phase['expected_cycles']}."
-                    ),
-                }
-            )
-
-        if expected_cycles and compare_cycles != expected_cycles:
-            difference = abs(compare_cycles - expected_cycles)
-            if compare_cycles < expected_cycles:
-                description = (
-                    f"Not enough cycles as expected for {phase['label']}"
+            cycle_expectation = phase2_mean
+            cycle_difference = abs(compare_cycles - phase2_mean)
+            if phase2_std == 0:
+                cycle_deviations = (
+                    0.0 if cycle_difference == 0 else float("inf")
                 )
             else:
-                description = f"Too many cycles for {phase['label']}"
+                cycle_deviations = cycle_difference / phase2_std
+            cycle_mismatch = cycle_deviations > 2
+        elif phase_key == "phase_1" or phase_key == "phase_2":
+            cycle_mismatch = False
+        else:
+            cycle_mismatch = expected_cycles is not None and (
+                compare_cycles != expected_cycles
+            )
+            if cycle_mismatch:
+                cycle_difference = abs(compare_cycles - expected_cycles)
+
+        if cycle_mismatch:
+            if phase_key == "phase_2":
+                description = (
+                    f"Phase 2 cycle count is {cycle_deviations:.2f} baseline "
+                    "standard deviations from the mean"
+                )
+                tag = "strong_outlier" if cycle_deviations > 3 else "review"
+            else:
+                description = (
+                    f"Cycle count differs from expected for {phase['label']}"
+                )
+                tag = (
+                    "strong_outlier"
+                    if phase_key == "phase_1" and cycle_difference >= 3
+                    else "review"
+                )
             findings.append(
                 {
                     "finding_type": "cycle_count",
                     "phase": phase["label"],
                     "time_s": start,
-                    "expected": expected_cycles,
+                    "expected": cycle_expectation,
                     "observed": compare_cycles,
                     "ratio": (
-                        compare_cycles / expected_cycles
-                        if expected_cycles
+                        compare_cycles / cycle_expectation
+                        if cycle_expectation
                         else ""
                     ),
                     "baseline_pos": "",
                     "compare_pos": "",
                     "residual": "",
-                    "tag": "strong_outlier" if difference > 1 else "review",
+                    "tag": tag,
                     "details": description,
                 }
             )
@@ -939,7 +1355,15 @@ class CompareWindow(QWidget):
             "Apply phase-specific smoothing to this baseline range."
         )
         phase_controls.addWidget(self.smooth_range_check)
-        phase_controls.addWidget(QLabel("Expected cycles (0 = tagged baseline count):"))
+        expected_cycles_label = QLabel(
+            "Expected cycles (0 = detected baseline count):"
+        )
+        expected_cycles_label.setToolTip(
+            "Used for Phase 1 cycle assessment and smoothing. Phase 2 cycle "
+            "assessment uses the mean and standard deviation of selected "
+            "baseline ranges."
+        )
+        phase_controls.addWidget(expected_cycles_label)
         self.expected_cycles_spin = QSpinBox()
         self.expected_cycles_spin.setRange(0, 10000)
         self.expected_cycles_spin.setValue(0)
@@ -1030,8 +1454,12 @@ class CompareWindow(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "Load baseline", f"Failed to load CSV:\n{exc}")
             return
-        self._baseline_extrema = None
-        self.extrema_source_label.setText("No baseline peak-to-peak CSV loaded.")
+        self._baseline_extrema = _detected_extrema(self._baseline)
+        self.extrema_source_label.setText(
+            "Detected from baseline tracking CSV."
+            if self._baseline_extrema is not None
+            else "No baseline peak-to-peak data detected."
+        )
         self._phase_ranges = []
         self.phase_table.setRowCount(0)
         self.remove_phase_btn.setEnabled(False)
@@ -1149,7 +1577,7 @@ class CompareWindow(QWidget):
                 phase["label"],
                 f"{phase['start_s']:.4f}",
                 f"{phase['end_s']:.4f}",
-                str(phase["expected_cycles"] or "tagged"),
+                str(phase["expected_cycles"] or "detected"),
                 str(stats["cycle_count"]) if stats else "—",
                 f"{stats['mean']:.4f}" if stats and stats["mean"] is not None else "—",
                 f"{stats['std']:.4f}" if stats and stats["std"] is not None else "—",
@@ -1692,19 +2120,32 @@ class CompareWindow(QWidget):
                     "compare_cycle_ranges": 0,
                     "baseline_samples": [],
                     "compare_samples": [],
-                    "findings": [],
                     "coverage_incomplete": False,
+                    "baseline_amplitudes": [],
+                    "compare_amplitudes": [],
+                    "baseline_periods": [],
+                    "compare_periods": [],
+                    "cycle_checks": [],
                 },
             )
             data["ranges"].append(phase)
             start_s = phase["start_s"]
             end_s = phase["end_s"]
 
+            baseline_stats = {
+                "cycle_count": None,
+                "sample_count": 0,
+                "amplitudes": [],
+                "mean": None,
+                "std": None,
+            }
+            baseline_period = {"periods": [], "mean": None, "std": None, "sample_count": 0}
             if self._baseline_extrema is not None:
                 baseline_extrema = self._baseline_extrema["rows"]
                 baseline_stats = _peak_to_peak_stats(
                     baseline_extrema, start_s, end_s
                 )
+                data["baseline_amplitudes"].extend(baseline_stats["amplitudes"])
                 if baseline_stats["mean"] is not None:
                     data["baseline_amplitude_sum"] += (
                         baseline_stats["mean"] * baseline_stats["sample_count"]
@@ -1715,12 +2156,21 @@ class CompareWindow(QWidget):
                 baseline_period = _cycle_period_stats(
                     baseline_extrema, start_s, end_s
                 )
+                data["baseline_periods"].extend(baseline_period["periods"])
                 if baseline_period["mean"] is not None:
                     data["baseline_period_sum"] += (
                         baseline_period["mean"] * baseline_period["sample_count"]
                     )
                     data["baseline_period_count"] += baseline_period["sample_count"]
 
+            compare_stats = {
+                "cycle_count": None,
+                "sample_count": 0,
+                "amplitudes": [],
+                "mean": None,
+                "std": None,
+            }
+            compare_period = {"periods": [], "mean": None, "std": None, "sample_count": 0}
             if self._compare is not None and offset is not None:
                 compare_mask = (
                     np.isfinite(self._compare["time_s"])
@@ -1735,37 +2185,58 @@ class CompareWindow(QWidget):
                         (compare_times >= compare_start)
                         & (compare_times <= compare_end)
                     )
-                    compare_extrema = find_peak_to_peak_extrema(
-                        compare_times[in_range], compare_positions[in_range]
-                    )
-                    compare_stats = _peak_to_peak_stats(
-                        compare_extrema, compare_start, compare_end
-                    )
-                    if compare_stats["mean"] is not None:
-                        data["compare_amplitude_sum"] += (
-                            compare_stats["mean"] * compare_stats["sample_count"]
+                    if np.count_nonzero(in_range) >= 3:
+                        compare_extrema = find_peak_to_peak_extrema(
+                            compare_times[in_range], compare_positions[in_range]
                         )
-                        data["compare_amplitude_count"] += (
-                            compare_stats["sample_count"]
+                        compare_stats = _peak_to_peak_stats(
+                            compare_extrema, compare_start, compare_end
                         )
-                    data["compare_cycles"] += compare_stats["cycle_count"]
-                    data["compare_cycle_ranges"] += 1
-                    compare_period = _cycle_period_stats(
-                        compare_extrema, compare_start, compare_end
-                    )
-                    if compare_period["mean"] is not None:
-                        data["compare_period_sum"] += (
-                            compare_period["mean"] * compare_period["sample_count"]
+                        data["compare_amplitudes"].extend(
+                            compare_stats["amplitudes"]
                         )
-                        data["compare_period_count"] += (
-                            compare_period["sample_count"]
+                        if compare_stats["mean"] is not None:
+                            data["compare_amplitude_sum"] += (
+                                compare_stats["mean"] * compare_stats["sample_count"]
+                            )
+                            data["compare_amplitude_count"] += (
+                                compare_stats["sample_count"]
+                            )
+                        data["compare_cycles"] += compare_stats["cycle_count"]
+                        data["compare_cycle_ranges"] += 1
+                        compare_period = _cycle_period_stats(
+                            compare_extrema, compare_start, compare_end
                         )
+                        data["compare_periods"].extend(compare_period["periods"])
+                        if compare_period["mean"] is not None:
+                            data["compare_period_sum"] += (
+                                compare_period["mean"]
+                                * compare_period["sample_count"]
+                            )
+                            data["compare_period_count"] += (
+                                compare_period["sample_count"]
+                            )
                     coverage = (
                         max(start_s, float(compare_times[0] + offset)),
                         min(end_s, float(compare_times[-1] + offset)),
                     )
                     if coverage[1] - coverage[0] < end_s - start_s:
                         data["coverage_incomplete"] = True
+            expected_cycles = (
+                int(phase["expected_cycles"])
+                if phase["expected_cycles"]
+                else baseline_stats["cycle_count"]
+            )
+            phase_key, _weight = _phase_weight(phase["label"])
+            data["cycle_checks"].append(
+                {
+                    "start_s": start_s,
+                    "end_s": end_s,
+                    "expected": expected_cycles,
+                    "baseline": baseline_stats["cycle_count"],
+                    "observed": compare_stats["cycle_count"],
+                }
+            )
 
             if self._baseline is not None and self._compare is not None:
                 position_key = "mm" if self._use_mm() else "px"
@@ -1794,29 +2265,46 @@ class CompareWindow(QWidget):
                     data["baseline_samples"].append(paired_baseline)
                     data["compare_samples"].append(paired_compare)
 
-                data["findings"].extend(
-                    finding
-                    for finding in self._outlier_rows
-                    if finding["tag"] == "strong_outlier"
-                    and start_s <= finding["time_s"] <= end_s
-                )
-
         overall_samples = {}
         report_sections = []
         for label, data in phase_data.items():
+            phase_key, _weight = _phase_weight(label)
             try:
-                phase_plot = _phase_waveform_figure(
-                    self._baseline,
-                    self._compare,
-                    data["ranges"],
-                    offset,
-                    self._use_mm(),
+                if phase_key == "phase_3":
+                    internal_phase_plot = None
+                    client_phase_plot = None
+                else:
+                    internal_phase_plot = _phase_waveform_figure(
+                        self._baseline,
+                        self._compare,
+                        data["ranges"],
+                        offset,
+                        self._use_mm(),
+                    )
+                    client_phase_plot = _phase_waveform_figure(
+                        self._baseline,
+                        self._compare,
+                        data["ranges"],
+                        offset,
+                        self._use_mm(),
+                        client_facing=True,
+                    )
+                phase_boxplot = (
+                    _phase_boxplot_figure(
+                        label,
+                        data["baseline_amplitudes"],
+                        data["compare_amplitudes"],
+                        data["baseline_periods"],
+                        data["compare_periods"],
+                    )
+                    if phase_key == "phase_1"
+                    else None
                 )
             except (ValueError, RuntimeError) as exc:
                 QMessageBox.warning(
                     self,
                     "Export report table",
-                    f"Failed to create waveform graph for {label}:\n{exc}",
+                    f"Failed to create report graph for {label}:\n{exc}",
                 )
                 return
             baseline_amplitude = (
@@ -1859,7 +2347,6 @@ class CompareWindow(QWidget):
                 if data["compare_samples"]
                 else np.array([], dtype=float)
             )
-            correlation = _pearson_correlation(baseline_samples, compare_samples)
             phase_key, weight = _phase_weight(label)
             if phase_key is not None and weight > 0 and baseline_samples.size:
                 if phase_key in overall_samples:
@@ -1875,41 +2362,6 @@ class CompareWindow(QWidget):
                     weight,
                     (baseline_samples, compare_samples),
                 )
-
-            confirmed = []
-            point_findings = sorted(
-                (
-                    finding
-                    for finding in data["findings"]
-                    if finding["finding_type"] == "point_residual"
-                ),
-                key=lambda finding: finding["time_s"],
-            )
-            if self._compare is not None:
-                valid_compare_times = self._compare["time_s"][
-                    np.isfinite(self._compare["time_s"])
-                    & np.isfinite(self._compare["px"])
-                ]
-                sample_interval = (
-                    float(np.median(np.diff(valid_compare_times)))
-                    if valid_compare_times.size > 1
-                    else 0.0
-                )
-            else:
-                sample_interval = 0.0
-            gap_limit = 1.5 * sample_interval
-            previous_time = None
-            for finding in point_findings:
-                finding_time = finding["time_s"]
-                if previous_time is None or finding_time - previous_time > gap_limit:
-                    confirmed.append(finding)
-                previous_time = finding_time
-            confirmed.extend(
-                finding
-                for finding in data["findings"]
-                if finding["finding_type"] != "point_residual"
-            )
-            outlier_count = len(confirmed) if self._compare is not None else None
 
             amplitude_difference = (
                 compare_amplitude - baseline_amplitude
@@ -1931,6 +2383,65 @@ class CompareWindow(QWidget):
             )
             period_pct = _relative_difference_pct(period_difference, baseline_period)
             cycle_pct = _relative_difference_pct(cycle_difference, baseline_cycles)
+            baseline_max_amplitude = (
+                max(data["baseline_amplitudes"])
+                if data["baseline_amplitudes"]
+                else None
+            )
+            compare_max_amplitude = (
+                max(data["compare_amplitudes"])
+                if data["compare_amplitudes"]
+                else None
+            )
+            max_amplitude_difference = (
+                compare_max_amplitude - baseline_max_amplitude
+                if compare_max_amplitude is not None
+                and baseline_max_amplitude is not None
+                else None
+            )
+            max_amplitude_pct = _relative_difference_pct(
+                max_amplitude_difference, baseline_max_amplitude
+            )
+            baseline_frequencies = [
+                1.0 / period
+                for period in data["baseline_periods"]
+                if period > 0
+            ]
+            compare_frequencies = [
+                1.0 / period
+                for period in data["compare_periods"]
+                if period > 0
+            ]
+            baseline_frequency = (
+                float(np.mean(baseline_frequencies))
+                if baseline_frequencies
+                else None
+            )
+            compare_frequency = (
+                float(np.mean(compare_frequencies))
+                if compare_frequencies
+                else None
+            )
+            frequency_difference = (
+                compare_frequency - baseline_frequency
+                if compare_frequency is not None and baseline_frequency is not None
+                else None
+            )
+            frequency_pct = _relative_difference_pct(
+                frequency_difference, baseline_frequency
+            )
+            baseline_frequency_range = (
+                f"{min(baseline_frequencies):.3f}–"
+                f"{max(baseline_frequencies):.3f} Hz"
+                if baseline_frequencies
+                else None
+            )
+            compare_frequency_range = (
+                f"{min(compare_frequencies):.3f}–"
+                f"{max(compare_frequencies):.3f} Hz"
+                if compare_frequencies
+                else None
+            )
 
             def format_value(value, suffix="", digits=3):
                 if value is None:
@@ -1958,63 +2469,294 @@ class CompareWindow(QWidget):
             compare_cell = comparison_value(
                 compare_amplitude, amplitude_difference, amplitude_pct, " px"
             )
-            rows = [
+            baseline_amplitude_mm = (
+                baseline_amplitude * _PX_TO_MM
+                if baseline_amplitude is not None
+                else None
+            )
+            compare_amplitude_mm = (
+                compare_amplitude * _PX_TO_MM
+                if compare_amplitude is not None
+                else None
+            )
+            amplitude_difference_mm = (
+                amplitude_difference * _PX_TO_MM
+                if amplitude_difference is not None
+                else None
+            )
+            baseline_max_amplitude_mm = (
+                baseline_max_amplitude * _PX_TO_MM
+                if baseline_max_amplitude is not None
+                else None
+            )
+            compare_max_amplitude_mm = (
+                compare_max_amplitude * _PX_TO_MM
+                if compare_max_amplitude is not None
+                else None
+            )
+            max_amplitude_difference_mm = (
+                max_amplitude_difference * _PX_TO_MM
+                if max_amplitude_difference is not None
+                else None
+            )
+            selected_intervals = []
+            compare_intervals = []
+            for phase_range in data["ranges"]:
+                start_s = phase_range["start_s"]
+                end_s = phase_range["end_s"]
+                duration = end_s - start_s
+                selected_intervals.append(
+                    f"{start_s:.6f}–{end_s:.6f} s ({duration:.6f} s)"
+                )
+                if offset is not None:
+                    compare_intervals.append(
+                        f"{start_s - offset:.6f}–{end_s - offset:.6f} s "
+                        f"({duration:.6f} s)"
+                    )
+            interval_row = (
+                "Selected interval(s): start–end (duration)",
+                "\n".join(selected_intervals) or "—",
+                "\n".join(compare_intervals)
+                if compare_intervals and self._compare is not None
+                else "—",
+            )
+            rows = [interval_row]
+            cycle_results, _cycle_unresolved = _evaluate_cycle_checks(
+                phase_key, data["cycle_checks"]
+            )
+            if phase_key == "phase_1":
+                rows.extend(
+                    [
+                        ("Mean peak-to-peak amplitude", baseline_cell, compare_cell),
+                        (
+                            "Mean peak-to-peak amplitude (mm)",
+                            format_value(baseline_amplitude_mm, " mm"),
+                            comparison_value(
+                                compare_amplitude_mm,
+                                amplitude_difference_mm,
+                                amplitude_pct,
+                                " mm",
+                            ),
+                        ),
+                        (
+                            "Mean frequency",
+                            format_value(baseline_frequency, " Hz"),
+                            comparison_value(
+                                compare_frequency,
+                                frequency_difference,
+                                frequency_pct,
+                                " Hz",
+                            ),
+                        ),
+                        (
+                            "Cycle frequency range (min–max)",
+                            baseline_frequency_range or "—",
+                            compare_frequency_range or "—",
+                        ),
+                        (
+                            "Mean cycle period",
+                            format_value(baseline_period, " s"),
+                            comparison_value(
+                                compare_period, period_difference, period_pct, " s"
+                            ),
+                        ),
+                    ]
+                )
+            elif phase_key == "phase_2":
+                rows.extend(
+                    [
+                        (
+                            "Maximum peak-to-peak amplitude "
+                            "(maximum of detected cycles)",
+                            format_value(baseline_max_amplitude, " px"),
+                            comparison_value(
+                                compare_max_amplitude,
+                                max_amplitude_difference,
+                                max_amplitude_pct,
+                                " px",
+                            ),
+                        ),
+                        (
+                            "Maximum peak-to-peak amplitude (mm)",
+                            format_value(baseline_max_amplitude_mm, " mm"),
+                            comparison_value(
+                                compare_max_amplitude_mm,
+                                max_amplitude_difference_mm,
+                                max_amplitude_pct,
+                                " mm",
+                            ),
+                        ),
+                        (
+                            "Mean cycle period (assessment metric)",
+                            format_value(baseline_period, " s"),
+                            comparison_value(
+                                compare_period, period_difference, period_pct, " s"
+                            ),
+                        ),
+                    ]
+                )
+            elif phase_key not in ("phase_1", "phase_2", "phase_3"):
+                rows.extend(
+                    [
+                        ("Mean peak-to-peak amplitude", baseline_cell, compare_cell),
+                        (
+                            "Mean cycle period",
+                            format_value(baseline_period, " s"),
+                            comparison_value(
+                                compare_period, period_difference, period_pct, " s"
+                            ),
+                        ),
+                    ]
+                )
+            if phase_key in ("phase_1", "phase_2"):
+                rows.append(
+                    (
+                        "Total detected cycles across selected intervals",
+                        format_value(baseline_cycles, digits=0),
+                        comparison_value(
+                            compare_cycles, cycle_difference, cycle_pct, digits=0
+                        ),
+                    )
+                )
+                for result in cycle_results:
+                    check = result["check"]
+                    interval_label = (
+                        f"{check['start_s']:.3f}–{check['end_s']:.3f} s"
+                    )
+                    if phase_key == "phase_1":
+                        baseline_cycle_text = (
+                            f"Expected {result['expected']} cycles"
+                            if result["expected"] is not None
+                            else "Expected count unavailable"
+                        )
+                        if check["observed"] is None:
+                            comparison_cycle_text = "Comparison count unavailable"
+                        else:
+                            comparison_cycle_text = (
+                                f"{check['observed']} cycles; difference "
+                                f"{result['difference']} — {result['status']}"
+                            )
+                    else:
+                        baseline_cycle_text = (
+                            f"{check['baseline']} cycles; reference mean "
+                            f"{result['baseline_mean']:.3g}, SD "
+                            f"{result['baseline_std']:.3g}"
+                            if result["baseline_mean"] is not None
+                            and result["baseline_std"] is not None
+                            and check["baseline"] is not None
+                            else "Reference mean/SD unavailable"
+                        )
+                        if check["observed"] is None:
+                            comparison_cycle_text = "Comparison count unavailable"
+                        elif result["deviations"] is None:
+                            comparison_cycle_text = (
+                                f"{check['observed']} cycles; cannot assess"
+                            )
+                        else:
+                            comparison_cycle_text = (
+                                f"{check['observed']} cycles; difference "
+                                f"{result['difference']:.2f} cycles "
+                                f"({result['deviations']:.2f} SD) — "
+                                f"{result['status']}"
+                            )
+                    rows.append(
+                        (
+                            f"Cycle-count check ({interval_label})",
+                            baseline_cycle_text,
+                            comparison_cycle_text,
+                        )
+                    )
+            if phase_key == "phase_1":
+                rows.extend(
+                    [
+                        (
+                            "Boxplot outlier measurements—amplitude "
+                            "(1.5×IQR rule)",
+                            format_value(
+                                _boxplot_outlier_count(data["baseline_amplitudes"]),
+                                digits=0,
+                            ),
+                            format_value(
+                                _boxplot_outlier_count(data["compare_amplitudes"]),
+                                digits=0,
+                            ),
+                        ),
+                        (
+                            "Boxplot outlier measurements—period (1.5×IQR rule)",
+                            format_value(
+                                _boxplot_outlier_count(data["baseline_periods"]),
+                                digits=0,
+                            ),
+                            format_value(
+                                _boxplot_outlier_count(data["compare_periods"]),
+                                digits=0,
+                            ),
+                        ),
+                    ]
+                )
+            rows.append(
                 (
-                    "Mean pk-pk (px)",
-                    baseline_cell,
-                    compare_cell,
-                ),
-                (
-                    "Period (s)",
-                    format_value(baseline_period, " s"),
-                    comparison_value(
-                        compare_period, period_difference, period_pct, " s"
-                    ),
-                ),
-                (
-                    "Number of cycles",
-                    format_value(baseline_cycles, digits=0),
-                    comparison_value(
-                        compare_cycles, cycle_difference, cycle_pct, digits=0
-                    ),
-                ),
-                (
-                    "Number of confirmed outliers",
-                    "Reference" if self._baseline is not None else "—",
-                    format_value(outlier_count, digits=0),
-                ),
-                (
-                    "Correlation score",
-                    "Reference" if self._baseline is not None else "—",
-                    format_value(correlation),
-                ),
-            ]
+                    "Assessment role",
+                    "Reference for overall result"
+                    if phase_key in ("phase_1", "phase_2")
+                    else "Informational only",
+                    "Informational only"
+                    if phase_key == "phase_3"
+                    else "Contributes to overall result"
+                    if phase_key in ("phase_1", "phase_2")
+                    else "Not assessed",
+                )
+            )
             notes = []
             if self._baseline_extrema is None:
                 notes.append(
-                    "Load baseline peak-to-peak extrema to calculate amplitude, "
-                    "period, and baseline cycle measurements."
+                    "Baseline peak-to-peak measurements were not available; "
+                    "amplitude, period, or cycle values may be blank."
                 )
             if self._compare is None:
-                notes.append("Load a comparison tracking CSV to calculate comparison results.")
+                notes.append("Comparison tracking data was not available.")
             elif data["coverage_incomplete"]:
                 notes.append(
-                    "Comparison coverage does not span the full selected baseline range."
+                    "Comparison data did not cover the full selected time range."
                 )
             if phase_key == "phase_3":
                 notes.append(
-                    "Phase III is excluded from the overall weighted correlation."
+                    "Phase 3 measurements are informational only and do not "
+                    "affect the device assessment."
                 )
-            phase_plot_data = phase_plot.getvalue() if phase_plot is not None else None
-            report_sections.append((label, rows, notes, phase_plot_data))
-            if phase_plot is not None:
-                phase_plot.close()
+            internal_plot_data = (
+                internal_phase_plot.getvalue()
+                if internal_phase_plot is not None
+                else None
+            )
+            client_plot_data = (
+                client_phase_plot.getvalue()
+                if client_phase_plot is not None
+                else None
+            )
+            report_sections.append(
+                (
+                    label,
+                    rows,
+                    notes,
+                    internal_plot_data,
+                    client_plot_data,
+                    phase_boxplot.getvalue() if phase_boxplot is not None else None,
+                )
+            )
+            for phase_plot in (internal_phase_plot, client_phase_plot, phase_boxplot):
+                if phase_plot is not None:
+                    phase_plot.close()
 
         overall_correlation = _weighted_correlation(overall_samples)
         overall_text = (
             f"{overall_correlation:.3f}"
             if overall_correlation is not None
             else "Not available (insufficient paired, varying samples)"
+        )
+        assessment, assessment_reasons = _assess_baseline_specifications(
+            phase_data,
+            compare_loaded=self._compare is not None,
         )
         baseline_name = (
             self._baseline["name"] if self._baseline is not None else "Not loaded"
@@ -2046,41 +2788,64 @@ class CompareWindow(QWidget):
                     )
 
                 if client_facing:
-                    document.add_heading("Results summary", level=2)
+                    document.add_heading("Quality assurance summary", level=2)
+                    summary_status = document.add_paragraph()
+                    summary_status.add_run(f"Assessment: {assessment}").bold = True
                     document.add_paragraph(
-                        f"Results are presented for {len(report_sections)} "
-                        f"behavior phase(s), comparing {compare_name} with "
-                        f"{baseline_name}."
+                        _client_assessment_description(assessment)
                     )
-                    for label, rows, _, _ in report_sections:
-                        results = {
-                            metric: compare_value.split(" (Δ ", 1)[0]
-                            for metric, _, compare_value in rows
-                        }
-                        document.add_paragraph(
-                            f"{label}: mean peak-to-peak "
-                            f"{results['Mean pk-pk (px)']}; period "
-                            f"{results['Period (s)']}; cycles "
-                            f"{results['Number of cycles']}; correlation score "
-                            f"{results['Correlation score']}."
-                        )
-                    overall = document.add_paragraph()
-                    overall.add_run("Overall correlation score: ").bold = True
-                    overall.add_run(overall_text)
+                    document.add_paragraph(
+                        "Phase 1 and Phase 2 measurements determine the "
+                        "assessment. Phase 3 results are shown for information "
+                        "only. See the appendix for how measurements and the "
+                        "assessment are calculated."
+                    )
+                else:
+                    assessment_line = document.add_paragraph()
+                    assessment_line.add_run("Device assessment: ").bold = True
+                    assessment_line.add_run(assessment)
+                    summary_heading = (
+                        "Reason for failure"
+                        if assessment == "FAIL"
+                        else "Reason for review"
+                        if assessment == "REVIEW"
+                        else "Assessment summary"
+                    )
+                    document.add_paragraph(summary_heading, style="Heading 2")
+                    if assessment == "PASS":
+                        document.add_paragraph(assessment_reasons[0])
+                    else:
+                        for reason in assessment_reasons:
+                            document.add_paragraph(reason, style="List Bullet")
+                    document.add_paragraph(
+                        "Assessment uses Phase 1 and Phase 2 only. The selected "
+                        "baseline is the reference; Phase 3 and correlation "
+                        "scores are informational. The appendix explains the "
+                        "calculations and pass, review, and fail rules."
+                    )
 
-                for label, rows, notes, phase_plot in report_sections:
-                    heading = document.add_heading(f"{label} table", level=2)
+                for (
+                    label,
+                    rows,
+                    notes,
+                    internal_phase_plot,
+                    client_phase_plot,
+                    boxplot,
+                ) in report_sections:
+                    if client_facing:
+                        heading_text = label
+                        phase_plot = client_phase_plot
+                    else:
+                        heading_text = label
+                        phase_plot = internal_phase_plot
+                    heading = document.add_heading(heading_text, level=2)
                     heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
                     table = document.add_table(rows=1, cols=3)
                     table.style = "Table Grid"
                     table.alignment = WD_TABLE_ALIGNMENT.CENTER
                     table.autofit = True
                     header_cells = table.rows[0].cells
-                    headers = (
-                        ("Measurement", "Baseline result", "Comparison result")
-                        if client_facing
-                        else ("Measurement differences", "Baseline", "Comparison")
-                    )
+                    headers = ("Measurement", "Baseline", "Comparison")
                     for cell, text in zip(header_cells, headers):
                         cell.text = text
                         cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
@@ -2091,45 +2856,115 @@ class CompareWindow(QWidget):
                         cell._tc.get_or_add_tcPr().append(shading)
 
                     for metric, baseline_value, compare_value in rows:
-                        if client_facing:
-                            compare_value = compare_value.split(" (Δ ", 1)[0]
                         cells = table.add_row().cells
                         for cell, text in zip(
                             cells, (metric, baseline_value, compare_value)
                         ):
                             cell.text = str(text)
-                            cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+                            cell.vertical_alignment = (
+                                WD_CELL_VERTICAL_ALIGNMENT.CENTER
+                            )
 
                     if phase_plot is not None:
-                        caption_text = (
-                            f"{label} waveform comparison"
-                            if client_facing
-                            else f"{label} waveform comparison "
-                            "(time shown relative to the start of each selected range)"
+                        caption = document.add_paragraph(
+                            f"{label} waveform comparison (selected time ranges)"
                         )
-                        caption = document.add_paragraph(caption_text)
                         caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                        document.add_picture(BytesIO(phase_plot), width=Inches(6.3))
+                        document.add_picture(BytesIO(phase_plot), width=Inches(6.0))
 
-                    if not client_facing:
+                    if boxplot is not None:
+                        caption = document.add_paragraph(
+                            f"{label} measurement distributions. Circles mark "
+                            "boxplot outliers (1.5×IQR)"
+                        )
+                        caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                        document.add_picture(BytesIO(boxplot), width=Inches(6.0))
+
+                    if notes:
                         notes_paragraph = document.add_paragraph()
                         notes_paragraph.add_run(
-                            f"NSI quality assurance notes ({label}): "
+                            f"Report note ({label}): "
                         ).bold = True
-                        notes_paragraph.add_run(
-                            " ".join(notes) if notes else "____________________________"
-                        )
+                        notes_paragraph.add_run(" ".join(notes))
 
-                if not client_facing:
-                    method = document.add_paragraph()
-                    method.add_run("Overall weighted correlation: ").bold = True
-                    method.add_run(
-                        f"{overall_text}. Pearson correlation is calculated per phase "
-                        "from aligned samples. The configured weights express relative "
-                        "trust in recorded points, not cycle counts. Comparison "
-                        "differences are relative to the baseline reference. Amplitude "
-                        "values are in pixels."
+                appendix = document.add_heading(
+                    "Appendix: Measurement and Assessment Method",
+                    level=1,
+                )
+                appendix.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                document.add_heading("How measurements are calculated", level=2)
+                for explanation in (
+                    "Measurement intervals: Times are elapsed seconds from the "
+                    "start of each recording. Selected start and end markers "
+                    "define each window; the comparison is aligned using the "
+                    "selected time offset.",
+                    "Amplitude: Each cycle amplitude is the distance between "
+                    "a peak and its adjacent bottom. Mean amplitude is the "
+                    "average of accepted cycles. When more than two are "
+                    "available, amplitudes below half the median of the other "
+                    "amplitudes are excluded. The Phase 2 table shows the "
+                    "maximum retained amplitude; the overall assessment uses "
+                    "mean amplitude.",
+                    "Frequency and period: Period is the time between "
+                    "consecutive peaks; mean period is their average. Cycle "
+                    "frequency = 1 / period; mean frequency is the average "
+                    "across cycles. The frequency range is the minimum and "
+                    "maximum cycle frequency.",
+                    "Cycle count: The detected count is the smaller of the "
+                    "number of detected peaks and bottoms within the interval.",
+                    "Standard deviation: Measures variation between values; "
+                    "at least two measurements are required. Sample SD = "
+                    "sqrt(sum((value − mean)²) / (n − 1)).",
+                    "Waveform highlights: Position differences and unusually "
+                    "different cycle amplitudes may be highlighted in the "
+                    "waveform view for visual investigation. They do not "
+                    "determine PASS, REVIEW, or FAIL.",
+                    "Boxplots: Phase 1 boxplots summarize cycle amplitude and "
+                    "period. The box shows the middle 50%, the centre line the "
+                    "median, and the marker the mean; points beyond 1.5 × IQR "
+                    "from the quartiles are statistical outliers, distinct "
+                    "from waveform deviations.",
+                ):
+                    document.add_paragraph(explanation, style="List Bullet")
+
+                document.add_heading("Pass, review, and fail criteria", level=2)
+                for explanation in (
+                    "Only Phase 1 and Phase 2 determine the overall assessment; "
+                    "other phases are informational.",
+                    "Phase 1 cycle count: A difference of 0–1 from the expected "
+                    "count does not require review; a difference of 2 or more "
+                    "triggers REVIEW. If no expected count is entered, the "
+                    "detected baseline count is used.",
+                    "Phase 2 cycle count: Selected baseline ranges establish "
+                    "the reference mean and sample SD; at least two ranges are "
+                    "required. A difference of 20 or more cycles from the "
+                    "baseline mean results in FAIL. A smaller difference over "
+                    "2 SD triggers REVIEW.",
+                    "Amplitude and period: In each assessed phase, comparison "
+                    "mean amplitude and mean period must be within baseline "
+                    "mean ± 3 sample SD. Each check requires at least two "
+                    "baseline measurements and one comparison measurement.",
+                    "Overall result: A definite failure takes precedence. "
+                    "Otherwise, missing or incomplete required data results "
+                    "in INCONCLUSIVE; review findings result in REVIEW; and "
+                    "meeting all required checks results in PASS.",
+                ):
+                    document.add_paragraph(explanation, style="List Bullet")
+                document.add_heading("Additional information", level=2)
+                document.add_paragraph(
+                    f"Pearson correlation ({overall_text}) describes waveform "
+                    "similarity and is informational only. The amplitude "
+                    "sensitivity setting affects visual cycle-amplitude "
+                    "highlights only; it does not change the assessment."
+                )
+
+                if client_facing:
+                    closing = document.add_paragraph(
+                        "Thank you for completing this quality assurance "
+                        "assessment. We appreciate your time and attention to "
+                        "the testing process."
                     )
+                    closing.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
             internal_document = Document()
             add_report_content(internal_document, client_facing=False)
