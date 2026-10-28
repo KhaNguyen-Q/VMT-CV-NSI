@@ -1,0 +1,13 @@
+{
+  "columns": [
+    { "source": "Phase", "target": "Phase", "type": "string" },
+    { "source": "Measurement", "target": "Measurement", "type": "string" },
+    { "source": "Baseline", "target": "Baseline", "type": "string" },
+    { "source": "Comparison", "target": "Comparison", "type": "string" },
+    { "source": "Camera", "target": "Camera", "type": "string" },
+    { "source": "FPS", "target": "FPS", "type": "string" },
+    { "source": "Treatment profile", "target": "Treatment profile", "type": "string" },
+    { "source": "Device number", "target": "Device number", "type": "string" },
+    { "source": "Client Name", "target": "Client Name", "type": "string" }
+  ]
+}

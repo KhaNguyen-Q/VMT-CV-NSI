@@ -12,5 +12,7 @@ test/
 
 *.csv
 *.json
+!config.example.json
+!mapping.example.json
 *plots
-
+*\docs\Improvements.md

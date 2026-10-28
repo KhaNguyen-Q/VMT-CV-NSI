@@ -18,6 +18,13 @@ git clone https://github.com/KhaNguyen-Q/VMT-CV-NSI
 cd Harmonic-Oscillator-CV
 python -m venv venv
 ```
+*Note: python.exe, set directory to app path. Need folders and files for executeable DEBUGGING
+
+ `pyinstaller --onedir --paths=app app/app.py`
+
+*Note: for complete python.exe that can be shared use --onefile PROD:
+
+`pyinstaller --onefile --paths=app app/app.py`
 
 Activate:
 
@@ -78,7 +85,25 @@ Load baseline peak-to-peak CSV... => Set peak-to-peak data
 7. Open report in Sharepoint or any Microsoft office 365 application supporting *Word*
 8. Edit report accordingly 
 
-In the comparison window, **Export report table** creates an internal NSI report and a client-facing report. The client report keeps the phase results and waveform plots, with a results summary, but omits calculation details and internal QA notes. It is saved beside the selected report with `_CLIENT` appended to the filename.
+In the comparison window, **Export report table** first prompts for optional camera, FPS, treatment profile, device number, and client name metadata. It then creates an internal NSI report, a client-facing report, and a JSON file containing the phase-grouped report table values and entered metadata. The JSON also includes a flattened `excel_table` with its column order and a Graph API-compatible `graph_payload.values` matrix for appending report rows to a preconfigured Excel table. All files are saved beside the selected report; the client report uses the `_CLIENT` suffix, and the JSON file uses the same base filename. The client report keeps the phase results and waveform plots, with a results summary, but omits calculation details and internal QA notes.
+
+### Uploading report rows to SharePoint Excel
+
+The report export remains local/offline. To upload an exported JSON report, copy `config.example.json` to `config.json` and `mapping.example.json` to `mapping.json`, then configure `config.json` with the Microsoft Entra tenant ID, public-client application ID, SharePoint site ID, workbook path relative to the site's drive, and existing Excel table name. The Entra application must be configured as a public client with `http://localhost` as a redirect URI and granted delegated Microsoft Graph `Files.ReadWrite.All` access. Configure `mapping.json` to match the report columns to the destination Excel table columns, in the required order. The sample mapping preserves report values as text; change a mapping type to `number`, `integer`, or `boolean` only when the corresponding source values use that type.
+
+Run the local mapping and request tests without Microsoft credentials or network access:
+
+```bash
+python -m unittest discover -s tests -p test_graph_upload.py -v
+```
+
+Run the upload explicitly from the repository root:
+
+```bash
+python app/app.py --upload-report path\to\comparison_report.json
+```
+
+You can optionally pass `--config path\to\config.json` and `--mapping path\to\mapping.json`. The app uses delegated login, silently reuses a cached session when available, and stores the token cache using the operating system's encrypted persistence. In a packaged build, copy the example files as `config.json` and `mapping.json` beside `app.exe`; run `app.exe --upload-report path\to\comparison_report.json` to upload. Do not distribute configured tenant files or user token caches in a build.
 
 For a plain-language explanation of the report's waveform correlation scores, see [Comparison report: understanding correlation](docs/ComparisonReportCorrelation.md).
 

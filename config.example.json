@@ -1,0 +1,7 @@
+{
+  "tenant_id": "YOUR_TENANT_ID",
+  "client_id": "YOUR_CLIENT_ID",
+  "sharepoint_site_id": "YOUR_SHAREPOINT_SITE_ID",
+  "file_path": "Shared Documents/Reports.xlsx",
+  "table_name": "ReportTable"
+}

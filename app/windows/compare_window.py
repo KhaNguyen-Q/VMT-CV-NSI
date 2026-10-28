@@ -11,18 +11,13 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 import numpy as np
 import pyqtgraph as pg
-from docx import Document
-from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
-from docx.shared import Inches
 from scipy.ndimage import percentile_filter
 from scipy.signal import savgol_filter
 from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QDialog,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -41,6 +36,8 @@ from utils.utils import (
     get_project_root,
 )
 from windows.graph_viewbox import GraphViewBox
+from windows.NSIReportformat import format_value, save_report_json, save_reports
+from windows.report_metadata_dialog import ReportMetadataDialog
 
 _project_root = get_project_root(os.path.dirname(os.path.abspath(__file__)))
 _PX_TO_MM = 1.0 / 10.0
@@ -240,6 +237,7 @@ def _evaluate_cycle_checks(phase_key, cycle_checks):
             "expected": None,
             "difference": None,
             "deviations": None,
+            "percent_difference": None,
             "baseline_mean": phase2_mean,
             "baseline_std": phase2_std,
         }
@@ -253,23 +251,33 @@ def _evaluate_cycle_checks(phase_key, cycle_checks):
                     "REVIEW" if result["difference"] >= 2 else "PASS"
                 )
         elif phase_key == "phase_2":
-            if phase2_mean is not None and phase2_std is not None:
+            if phase2_mean is not None:
                 if observed is not None:
                     difference = abs(observed - phase2_mean)
                     deviations = (
-                        0.0
+                        None
+                        if phase2_std is None
+                        else 0.0
                         if difference == 0
                         else float("inf")
                         if phase2_std == 0
                         else difference / phase2_std
                     )
+                    percent_difference = (
+                        0.0
+                        if difference == 0
+                        else float("inf")
+                        if phase2_mean == 0
+                        else difference / abs(phase2_mean) * 100
+                    )
                     result["difference"] = difference
                     result["deviations"] = deviations
+                    result["percent_difference"] = percent_difference
                     result["status"] = (
                         "FAIL"
                         if difference >= 20
                         else "REVIEW"
-                        if deviations > 2
+                        if percent_difference >= 20
                         else "PASS"
                     )
             if check["baseline"] is None:
@@ -341,10 +349,9 @@ def _assess_baseline_specifications(
                 cycle_detail = (
                     f"{label} range {check['start_s']:.3f}-{check['end_s']:.3f} s: "
                     f"{observed} comparison cycles; baseline mean "
-                    f"{result['baseline_mean']:.3g}, SD "
-                    f"{result['baseline_std']:.3g}; difference "
+                    f"{result['baseline_mean']:.3g}; difference "
                     f"{result['difference']:.2f} cycles "
-                    f"({result['deviations']:.2f} SD)."
+                    f"({result['percent_difference']:.1f}% of baseline mean)."
                 )
                 if result["status"] == "FAIL":
                     cycle_detail += " Phase 2 cycle-count difference of at least 20 fails."
@@ -370,13 +377,16 @@ def _assess_baseline_specifications(
                 data["compare_periods"],
             ),
         ):
+            if _phase_key == "phase_1":
+                baseline_values = _boxplot_inliers(baseline_values)
+                compare_values = _boxplot_inliers(compare_values)
             if len(baseline_values) < 2:
                 unresolved.append(
                     f"{label} {metric}: at least two baseline measurements are "
                     "needed to calculate a standard deviation."
                 )
                 continue
-            if not compare_values:
+            if len(compare_values) == 0:
                 unresolved.append(
                     f"{label} {metric}: no comparison measurements were available."
                 )
@@ -745,12 +755,12 @@ def _phase_boxplot_figure(
     for axis, title, baseline_values, compare_values, unit in (
         (
             amplitude_axis,
-            "Peak-to-peak amplitude",
+            "Peak-to-peak px",
             baseline_amplitudes,
             compare_amplitudes,
             "px",
         ),
-        (period_axis, "Cycle period", baseline_periods, compare_periods, "s"),
+        (period_axis, "Cycle period", baseline_periods, compare_periods, "time (s)"),
     ):
         groups = []
         labels = []
@@ -807,6 +817,18 @@ def _boxplot_outlier_count(values):
     lower_fence = lower_quartile - 1.5 * iqr
     upper_fence = upper_quartile + 1.5 * iqr
     return int(np.count_nonzero((values < lower_fence) | (values > upper_fence)))
+
+
+def _boxplot_inliers(values):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size < 2:
+        return values
+    lower_quartile, upper_quartile = np.percentile(values, [25, 75])
+    iqr = upper_quartile - lower_quartile
+    lower_fence = lower_quartile - 1.5 * iqr
+    upper_fence = upper_quartile + 1.5 * iqr
+    return values[(values >= lower_fence) & (values <= upper_fence)]
 
 
 def _odd_window(length, fraction):
@@ -1039,10 +1061,12 @@ def behavior_outliers(
     offset,
     phase_ranges,
     baseline_extrema=None,
+    compare_extrema=None,
     n_sigmas=3.0,
 ):
     """Compare each range with baseline extrema and configured expectations."""
     findings = []
+    compare_extrema = compare_extrema or []
     phase2_baseline_counts = [
         _peak_to_peak_stats(baseline_extrema, phase["start_s"], phase["end_s"])[
             "cycle_count"
@@ -1069,21 +1093,22 @@ def behavior_outliers(
         end = phase["end_s"]
         compare_start = start - offset
         compare_end = end - offset
-        compare_mask = (t_cmp >= compare_start) & (t_cmp <= compare_end)
 
         baseline_stats = (
             _peak_to_peak_stats(baseline_extrema, start, end)
             if baseline_extrema is not None
             else {"cycle_count": 0, "sample_count": 0, "mean": None, "std": None}
         )
-        compare_extrema = find_peak_to_peak_extrema(
-            t_cmp[compare_mask], y_cmp[compare_mask]
+        compare_stats = _peak_to_peak_stats(
+            compare_extrema, compare_start, compare_end
         )
+        phase_compare_extrema = [
+            row
+            for row in compare_extrema
+            if compare_start <= row["time_s"] <= compare_end
+        ]
         baseline_cycles = baseline_stats["cycle_count"]
-        compare_cycles = min(
-            sum(row["label"] == "top" for row in compare_extrema),
-            sum(row["label"] == "bottom" for row in compare_extrema),
-        )
+        compare_cycles = compare_stats["cycle_count"]
         expected_cycles = phase["expected_cycles"] or baseline_cycles
         phase_key, _weight = _phase_weight(phase["label"])
 
@@ -1168,7 +1193,7 @@ def behavior_outliers(
             1e-9,
         )
 
-        for row in compare_extrema:
+        for row in phase_compare_extrema:
             amplitude = row["peak_to_peak_px"]
             if amplitude is None:
                 continue
@@ -1220,6 +1245,7 @@ class CompareWindow(QWidget):
         self._baseline = None
         self._baseline_extrema = None
         self._compare = None
+        self._compare_extrema = None
         self._outlier_rows = []
         self._phase_ranges = []
         self._setting_offset = False
@@ -1505,6 +1531,7 @@ class CompareWindow(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "Load compare", f"Failed to load CSV:\n{exc}")
             return
+        self._compare_extrema = _detected_extrema(self._compare)
         self._align_and_redraw(estimate_offset=True)
 
     def _on_offset_changed(self, _value):
@@ -1674,16 +1701,20 @@ class CompareWindow(QWidget):
                 if self._baseline is not None and self._compare is not None
                 else None
             )
-            compare_times = compare_positions = None
+            compare_times = None
             if self._compare is not None and np.isfinite(self._compare["px"]).any():
                 compare_mask = (
                     np.isfinite(self._compare["time_s"])
                     & np.isfinite(self._compare["px"])
                 )
                 compare_times = self._compare["time_s"][compare_mask]
-                compare_positions = self._compare["px"][compare_mask]
+                compare_extrema_rows = (
+                    self._compare_extrema["rows"]
+                    if self._compare_extrema is not None
+                    else []
+                )
                 if compare_times.size < 2:
-                    compare_times = compare_positions = None
+                    compare_times = None
 
             correlation_baseline_times = correlation_baseline_values = None
             correlation_compare_times = correlation_compare_values = None
@@ -1799,20 +1830,13 @@ class CompareWindow(QWidget):
                                 * (coverage_end - coverage_start)
                                 / (phase["end_s"] - phase["start_s"])
                             )
-                            in_range = (compare_times >= compare_start) & (
-                                compare_times <= compare_end
-                            )
-                            compare_extrema = find_peak_to_peak_extrema(
-                                compare_times[in_range],
-                                compare_positions[in_range],
-                            )
                             compare_stats = _peak_to_peak_stats(
-                                compare_extrema,
+                                compare_extrema_rows,
                                 compare_start,
                                 compare_end,
                             )
                             compare_period = _cycle_period_stats(
-                                compare_extrema,
+                                compare_extrema_rows,
                                 compare_start,
                                 compare_end,
                             )
@@ -2094,6 +2118,11 @@ class CompareWindow(QWidget):
         if not path.lower().endswith(".docx"):
             path += ".docx"
 
+        metadata_dialog = ReportMetadataDialog(self)
+        if metadata_dialog.exec_() != QDialog.Accepted:
+            return
+        report_metadata = metadata_dialog.metadata()
+
         offset = (
             float(self.offset_spin.value())
             if self._baseline is not None and self._compare is not None
@@ -2177,7 +2206,11 @@ class CompareWindow(QWidget):
                     & np.isfinite(self._compare["px"])
                 )
                 compare_times = self._compare["time_s"][compare_mask]
-                compare_positions = self._compare["px"][compare_mask]
+                compare_extrema_rows = (
+                    self._compare_extrema["rows"]
+                    if self._compare_extrema is not None
+                    else []
+                )
                 if compare_times.size >= 2:
                     compare_start = start_s - offset
                     compare_end = end_s - offset
@@ -2186,11 +2219,8 @@ class CompareWindow(QWidget):
                         & (compare_times <= compare_end)
                     )
                     if np.count_nonzero(in_range) >= 3:
-                        compare_extrema = find_peak_to_peak_extrema(
-                            compare_times[in_range], compare_positions[in_range]
-                        )
                         compare_stats = _peak_to_peak_stats(
-                            compare_extrema, compare_start, compare_end
+                            compare_extrema_rows, compare_start, compare_end
                         )
                         data["compare_amplitudes"].extend(
                             compare_stats["amplitudes"]
@@ -2205,7 +2235,7 @@ class CompareWindow(QWidget):
                         data["compare_cycles"] += compare_stats["cycle_count"]
                         data["compare_cycle_ranges"] += 1
                         compare_period = _cycle_period_stats(
-                            compare_extrema, compare_start, compare_end
+                            compare_extrema_rows, compare_start, compare_end
                         )
                         data["compare_periods"].extend(compare_period["periods"])
                         if compare_period["mean"] is not None:
@@ -2443,11 +2473,6 @@ class CompareWindow(QWidget):
                 else None
             )
 
-            def format_value(value, suffix="", digits=3):
-                if value is None:
-                    return "—"
-                return f"{value:.{digits}f}{suffix}"
-
             def comparison_value(value, difference, percent, suffix="", digits=3):
                 if value is None:
                     return "—"
@@ -2499,6 +2524,66 @@ class CompareWindow(QWidget):
                 if max_amplitude_difference is not None
                 else None
             )
+            baseline_mean_amplitude = (
+                baseline_amplitude * 0.5
+                if baseline_amplitude is not None
+                else None
+            )
+            compare_mean_amplitude = (
+                compare_amplitude * 0.5
+                if compare_amplitude is not None
+                else None
+            )
+            mean_amplitude_difference = (
+                amplitude_difference * 0.5
+                if amplitude_difference is not None
+                else None
+            )
+            baseline_mean_amplitude_mm = (
+                baseline_mean_amplitude * _PX_TO_MM
+                if baseline_mean_amplitude is not None
+                else None
+            )
+            compare_mean_amplitude_mm = (
+                compare_mean_amplitude * _PX_TO_MM
+                if compare_mean_amplitude is not None
+                else None
+            )
+            mean_amplitude_difference_mm = (
+                mean_amplitude_difference * _PX_TO_MM
+                if mean_amplitude_difference is not None
+                else None
+            )
+            baseline_max_amplitude_value = (
+                baseline_max_amplitude * 0.5
+                if baseline_max_amplitude is not None
+                else None
+            )
+            compare_max_amplitude_value = (
+                compare_max_amplitude * 0.5
+                if compare_max_amplitude is not None
+                else None
+            )
+            max_amplitude_difference_value = (
+                max_amplitude_difference * 0.5
+                if max_amplitude_difference is not None
+                else None
+            )
+            baseline_max_amplitude_value_mm = (
+                baseline_max_amplitude_value * _PX_TO_MM
+                if baseline_max_amplitude_value is not None
+                else None
+            )
+            compare_max_amplitude_value_mm = (
+                compare_max_amplitude_value * _PX_TO_MM
+                if compare_max_amplitude_value is not None
+                else None
+            )
+            max_amplitude_difference_value_mm = (
+                max_amplitude_difference_value * _PX_TO_MM
+                if max_amplitude_difference_value is not None
+                else None
+            )
             selected_intervals = []
             compare_intervals = []
             for phase_range in data["ranges"]:
@@ -2506,12 +2591,12 @@ class CompareWindow(QWidget):
                 end_s = phase_range["end_s"]
                 duration = end_s - start_s
                 selected_intervals.append(
-                    f"{start_s:.6f}–{end_s:.6f} s ({duration:.6f} s)"
+                    f"{start_s:.2f}–{end_s:.2f} s ({duration:.2f} s)"
                 )
                 if offset is not None:
                     compare_intervals.append(
-                        f"{start_s - offset:.6f}–{end_s - offset:.6f} s "
-                        f"({duration:.6f} s)"
+                        f"{start_s - offset:.2f}–{end_s - offset:.2f} s "
+                        f"({duration:.2f} s)"
                     )
             interval_row = (
                 "Selected interval(s): start–end (duration)",
@@ -2527,13 +2612,33 @@ class CompareWindow(QWidget):
             if phase_key == "phase_1":
                 rows.extend(
                     [
-                        ("Mean peak-to-peak amplitude", baseline_cell, compare_cell),
+                        ("Mean peak-to-peak", baseline_cell, compare_cell),
                         (
-                            "Mean peak-to-peak amplitude (mm)",
+                            "Mean amplitude",
+                            format_value(baseline_mean_amplitude, " px"),
+                            comparison_value(
+                                compare_mean_amplitude,
+                                mean_amplitude_difference,
+                                amplitude_pct,
+                                " px",
+                            ),
+                        ),
+                        (
+                            "Mean peak-to-peak (mm)",
                             format_value(baseline_amplitude_mm, " mm"),
                             comparison_value(
                                 compare_amplitude_mm,
                                 amplitude_difference_mm,
+                                amplitude_pct,
+                                " mm",
+                            ),
+                        ),
+                        (
+                            "Mean amplitude (mm)",
+                            format_value(baseline_mean_amplitude_mm, " mm"),
+                            comparison_value(
+                                compare_mean_amplitude_mm,
+                                mean_amplitude_difference_mm,
                                 amplitude_pct,
                                 " mm",
                             ),
@@ -2566,7 +2671,7 @@ class CompareWindow(QWidget):
                 rows.extend(
                     [
                         (
-                            "Maximum peak-to-peak amplitude "
+                            "Maximum peak-to-peak "
                             "(maximum of detected cycles)",
                             format_value(baseline_max_amplitude, " px"),
                             comparison_value(
@@ -2577,11 +2682,31 @@ class CompareWindow(QWidget):
                             ),
                         ),
                         (
-                            "Maximum peak-to-peak amplitude (mm)",
+                            "Maximum amplitude",
+                            format_value(baseline_max_amplitude_value, " px"),
+                            comparison_value(
+                                compare_max_amplitude_value,
+                                max_amplitude_difference_value,
+                                max_amplitude_pct,
+                                " px",
+                            ),
+                        ),
+                        (
+                            "Maximum peak-to-peak (mm)",
                             format_value(baseline_max_amplitude_mm, " mm"),
                             comparison_value(
                                 compare_max_amplitude_mm,
                                 max_amplitude_difference_mm,
+                                max_amplitude_pct,
+                                " mm",
+                            ),
+                        ),
+                        (
+                            "Maximum amplitude (mm)",
+                            format_value(baseline_max_amplitude_value_mm, " mm"),
+                            comparison_value(
+                                compare_max_amplitude_value_mm,
+                                max_amplitude_difference_value_mm,
                                 max_amplitude_pct,
                                 " mm",
                             ),
@@ -2598,7 +2723,7 @@ class CompareWindow(QWidget):
             elif phase_key not in ("phase_1", "phase_2", "phase_3"):
                 rows.extend(
                     [
-                        ("Mean peak-to-peak amplitude", baseline_cell, compare_cell),
+                        ("Mean peak-to-peak", baseline_cell, compare_cell),
                         (
                             "Mean cycle period",
                             format_value(baseline_period, " s"),
@@ -2648,7 +2773,7 @@ class CompareWindow(QWidget):
                         )
                         if check["observed"] is None:
                             comparison_cycle_text = "Comparison count unavailable"
-                        elif result["deviations"] is None:
+                        elif result["percent_difference"] is None:
                             comparison_cycle_text = (
                                 f"{check['observed']} cycles; cannot assess"
                             )
@@ -2656,7 +2781,7 @@ class CompareWindow(QWidget):
                             comparison_cycle_text = (
                                 f"{check['observed']} cycles; difference "
                                 f"{result['difference']:.2f} cycles "
-                                f"({result['deviations']:.2f} SD) — "
+                                f"({result['percent_difference']:.1f}% of mean) — "
                                 f"{result['status']}"
                             )
                     rows.append(
@@ -2765,213 +2890,32 @@ class CompareWindow(QWidget):
             self._compare["name"] if self._compare is not None else "Not loaded"
         )
         client_path = os.path.splitext(path)[0] + "_CLIENT.docx"
+        json_path = os.path.splitext(path)[0] + ".json"
+        client_description = _client_assessment_description(assessment)
         try:
-            parent = os.path.dirname(os.path.abspath(path))
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-
-            def add_report_content(document, client_facing):
-                title = document.add_heading(
-                    "NSI Client Report" if client_facing else "NSI Report",
-                    level=1,
-                )
-                title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                metadata = document.add_paragraph()
-                metadata.add_run("Baseline: ").bold = True
-                metadata.add_run(baseline_name)
-                metadata.add_run("    Comparison: ").bold = True
-                metadata.add_run(compare_name)
-                if not client_facing:
-                    metadata.add_run("    Phase offset: ").bold = True
-                    metadata.add_run(
-                        format_value(offset, " s") if offset is not None else "—"
-                    )
-
-                if client_facing:
-                    document.add_heading("Quality assurance summary", level=2)
-                    summary_status = document.add_paragraph()
-                    summary_status.add_run(f"Assessment: {assessment}").bold = True
-                    document.add_paragraph(
-                        _client_assessment_description(assessment)
-                    )
-                    document.add_paragraph(
-                        "Phase 1 and Phase 2 measurements determine the "
-                        "assessment. Phase 3 results are shown for information "
-                        "only. See the appendix for how measurements and the "
-                        "assessment are calculated."
-                    )
-                else:
-                    assessment_line = document.add_paragraph()
-                    assessment_line.add_run("Device assessment: ").bold = True
-                    assessment_line.add_run(assessment)
-                    summary_heading = (
-                        "Reason for failure"
-                        if assessment == "FAIL"
-                        else "Reason for review"
-                        if assessment == "REVIEW"
-                        else "Assessment summary"
-                    )
-                    document.add_paragraph(summary_heading, style="Heading 2")
-                    if assessment == "PASS":
-                        document.add_paragraph(assessment_reasons[0])
-                    else:
-                        for reason in assessment_reasons:
-                            document.add_paragraph(reason, style="List Bullet")
-                    document.add_paragraph(
-                        "Assessment uses Phase 1 and Phase 2 only. The selected "
-                        "baseline is the reference; Phase 3 and correlation "
-                        "scores are informational. The appendix explains the "
-                        "calculations and pass, review, and fail rules."
-                    )
-
-                for (
-                    label,
-                    rows,
-                    notes,
-                    internal_phase_plot,
-                    client_phase_plot,
-                    boxplot,
-                ) in report_sections:
-                    if client_facing:
-                        heading_text = label
-                        phase_plot = client_phase_plot
-                    else:
-                        heading_text = label
-                        phase_plot = internal_phase_plot
-                    heading = document.add_heading(heading_text, level=2)
-                    heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    table = document.add_table(rows=1, cols=3)
-                    table.style = "Table Grid"
-                    table.alignment = WD_TABLE_ALIGNMENT.CENTER
-                    table.autofit = True
-                    header_cells = table.rows[0].cells
-                    headers = ("Measurement", "Baseline", "Comparison")
-                    for cell, text in zip(header_cells, headers):
-                        cell.text = text
-                        cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-                        for run in cell.paragraphs[0].runs:
-                            run.bold = True
-                        shading = OxmlElement("w:shd")
-                        shading.set(qn("w:fill"), "F2F2F2")
-                        cell._tc.get_or_add_tcPr().append(shading)
-
-                    for metric, baseline_value, compare_value in rows:
-                        cells = table.add_row().cells
-                        for cell, text in zip(
-                            cells, (metric, baseline_value, compare_value)
-                        ):
-                            cell.text = str(text)
-                            cell.vertical_alignment = (
-                                WD_CELL_VERTICAL_ALIGNMENT.CENTER
-                            )
-
-                    if phase_plot is not None:
-                        caption = document.add_paragraph(
-                            f"{label} waveform comparison (selected time ranges)"
-                        )
-                        caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                        document.add_picture(BytesIO(phase_plot), width=Inches(6.0))
-
-                    if boxplot is not None:
-                        caption = document.add_paragraph(
-                            f"{label} measurement distributions. Circles mark "
-                            "boxplot outliers (1.5×IQR)"
-                        )
-                        caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                        document.add_picture(BytesIO(boxplot), width=Inches(6.0))
-
-                    if notes:
-                        notes_paragraph = document.add_paragraph()
-                        notes_paragraph.add_run(
-                            f"Report note ({label}): "
-                        ).bold = True
-                        notes_paragraph.add_run(" ".join(notes))
-
-                appendix = document.add_heading(
-                    "Appendix: Measurement and Assessment Method",
-                    level=1,
-                )
-                appendix.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                document.add_heading("How measurements are calculated", level=2)
-                for explanation in (
-                    "Measurement intervals: Times are elapsed seconds from the "
-                    "start of each recording. Selected start and end markers "
-                    "define each window; the comparison is aligned using the "
-                    "selected time offset.",
-                    "Amplitude: Each cycle amplitude is the distance between "
-                    "a peak and its adjacent bottom. Mean amplitude is the "
-                    "average of accepted cycles. When more than two are "
-                    "available, amplitudes below half the median of the other "
-                    "amplitudes are excluded. The Phase 2 table shows the "
-                    "maximum retained amplitude; the overall assessment uses "
-                    "mean amplitude.",
-                    "Frequency and period: Period is the time between "
-                    "consecutive peaks; mean period is their average. Cycle "
-                    "frequency = 1 / period; mean frequency is the average "
-                    "across cycles. The frequency range is the minimum and "
-                    "maximum cycle frequency.",
-                    "Cycle count: The detected count is the smaller of the "
-                    "number of detected peaks and bottoms within the interval.",
-                    "Standard deviation: Measures variation between values; "
-                    "at least two measurements are required. Sample SD = "
-                    "sqrt(sum((value − mean)²) / (n − 1)).",
-                    "Waveform highlights: Position differences and unusually "
-                    "different cycle amplitudes may be highlighted in the "
-                    "waveform view for visual investigation. They do not "
-                    "determine PASS, REVIEW, or FAIL.",
-                    "Boxplots: Phase 1 boxplots summarize cycle amplitude and "
-                    "period. The box shows the middle 50%, the centre line the "
-                    "median, and the marker the mean; points beyond 1.5 × IQR "
-                    "from the quartiles are statistical outliers, distinct "
-                    "from waveform deviations.",
-                ):
-                    document.add_paragraph(explanation, style="List Bullet")
-
-                document.add_heading("Pass, review, and fail criteria", level=2)
-                for explanation in (
-                    "Only Phase 1 and Phase 2 determine the overall assessment; "
-                    "other phases are informational.",
-                    "Phase 1 cycle count: A difference of 0–1 from the expected "
-                    "count does not require review; a difference of 2 or more "
-                    "triggers REVIEW. If no expected count is entered, the "
-                    "detected baseline count is used.",
-                    "Phase 2 cycle count: Selected baseline ranges establish "
-                    "the reference mean and sample SD; at least two ranges are "
-                    "required. A difference of 20 or more cycles from the "
-                    "baseline mean results in FAIL. A smaller difference over "
-                    "2 SD triggers REVIEW.",
-                    "Amplitude and period: In each assessed phase, comparison "
-                    "mean amplitude and mean period must be within baseline "
-                    "mean ± 3 sample SD. Each check requires at least two "
-                    "baseline measurements and one comparison measurement.",
-                    "Overall result: A definite failure takes precedence. "
-                    "Otherwise, missing or incomplete required data results "
-                    "in INCONCLUSIVE; review findings result in REVIEW; and "
-                    "meeting all required checks results in PASS.",
-                ):
-                    document.add_paragraph(explanation, style="List Bullet")
-                document.add_heading("Additional information", level=2)
-                document.add_paragraph(
-                    f"Pearson correlation ({overall_text}) describes waveform "
-                    "similarity and is informational only. The amplitude "
-                    "sensitivity setting affects visual cycle-amplitude "
-                    "highlights only; it does not change the assessment."
-                )
-
-                if client_facing:
-                    closing = document.add_paragraph(
-                        "Thank you for completing this quality assurance "
-                        "assessment. We appreciate your time and attention to "
-                        "the testing process."
-                    )
-                    closing.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-            internal_document = Document()
-            add_report_content(internal_document, client_facing=False)
-            client_document = Document()
-            add_report_content(client_document, client_facing=True)
-            internal_document.save(path)
-            client_document.save(client_path)
+            save_reports(
+                path,
+                client_path,
+                baseline_name,
+                compare_name,
+                offset,
+                assessment,
+                assessment_reasons,
+                client_description,
+                report_sections,
+                report_metadata,
+            )
+            save_report_json(
+                json_path,
+                baseline_name,
+                compare_name,
+                offset,
+                report_metadata,
+                assessment,
+                assessment_reasons,
+                client_description,
+                report_sections,
+            )
         except OSError as exc:
             QMessageBox.warning(
                 self, "Export report table", f"Failed to save report:\n{exc}"
@@ -2980,7 +2924,7 @@ class CompareWindow(QWidget):
         QMessageBox.information(
             self,
             "Export report table",
-            f"Saved reports:\n{path}\n{client_path}",
+            f"Saved reports:\n{path}\n{client_path}\n{json_path}",
         )
 
     def _use_mm(self):
@@ -3107,6 +3051,11 @@ class CompareWindow(QWidget):
                     offset,
                     self._phase_ranges,
                     baseline_extrema=self._baseline_extrema["rows"],
+                    compare_extrema=(
+                        self._compare_extrema["rows"]
+                        if self._compare_extrema is not None
+                        else []
+                    ),
                     n_sigmas=sensitivity,
                 )
             self._outlier_rows.extend(behavior_findings)
