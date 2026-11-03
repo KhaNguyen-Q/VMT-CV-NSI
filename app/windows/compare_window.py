@@ -2,6 +2,7 @@
 
 import csv
 from io import BytesIO
+import json
 import os
 
 import matplotlib
@@ -23,12 +24,34 @@ from PyQt5.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
+    QPlainTextEdit,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
+
+try:
+    from automation.detection_profiles import (
+        default_profiles_path,
+        default_treatment_profiles,
+        load_treatment_profiles,
+        save_treatment_profiles,
+    )
+    from automation.phase_detector import detect_phase_ranges
+except ModuleNotFoundError:
+    from app.automation.detection_profiles import (
+        default_profiles_path,
+        default_treatment_profiles,
+        load_treatment_profiles,
+        save_treatment_profiles,
+    )
+    from app.automation.phase_detector import detect_phase_ranges
+try:
+    from windows.treatment_profile_dialog import TreatmentProfileDialog
+except ModuleNotFoundError:
+    from app.windows.treatment_profile_dialog import TreatmentProfileDialog
 
 from utils.utils import (
     dominant_fft_frequency,
@@ -1250,6 +1273,21 @@ class CompareWindow(QWidget):
         self._phase_ranges = []
         self._setting_offset = False
         self._phase_region = None
+        self._detection_metadata = None
+        self._last_detection_result = None
+        self._detection_profile_path = default_profiles_path()
+        try:
+            self._treatment_profiles = load_treatment_profiles(
+                self._detection_profile_path
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            QMessageBox.warning(
+                self,
+                "Treatment profiles",
+                f"Could not load treatment profiles:\n{exc}\n\n"
+                "Built-in profiles will be used until the profile library is saved.",
+            )
+            self._treatment_profiles = default_treatment_profiles()
 
         layout = QVBoxLayout(self)
 
@@ -1367,6 +1405,23 @@ class CompareWindow(QWidget):
         extrema_controls.addStretch(1)
         layout.addLayout(extrema_controls)
 
+        profile_controls = QHBoxLayout()
+        profile_controls.addWidget(QLabel("Treatment profile:"))
+        self.treatment_profile_combo = QComboBox()
+        self._refresh_treatment_profile_combo()
+        profile_controls.addWidget(self.treatment_profile_combo)
+        self.manage_profiles_btn = QPushButton("Manage profiles…")
+        self.manage_profiles_btn.clicked.connect(self._manage_treatment_profiles)
+        profile_controls.addWidget(self.manage_profiles_btn)
+        self.detection_diagnostics_btn = QPushButton("Detection diagnostics…")
+        self.detection_diagnostics_btn.setEnabled(False)
+        self.detection_diagnostics_btn.clicked.connect(
+            self._show_detection_diagnostics
+        )
+        profile_controls.addWidget(self.detection_diagnostics_btn)
+        profile_controls.addStretch(1)
+        layout.addLayout(profile_controls)
+
         phase_controls = QHBoxLayout()
         phase_controls.addWidget(QLabel("Baseline behavior:"))
         self.phase_combo = QComboBox()
@@ -1410,6 +1465,14 @@ class CompareWindow(QWidget):
         self.export_phase_ranges_btn.setEnabled(False)
         self.export_phase_ranges_btn.clicked.connect(self._save_phase_ranges)
         phase_controls.addWidget(self.export_phase_ranges_btn)
+        self.auto_detect_phases_btn = QPushButton("Auto Detect Phases")
+        self.auto_detect_phases_btn.setEnabled(False)
+        self.auto_detect_phases_btn.setToolTip(
+            "Detect complete vibration events from the loaded baseline signal. "
+            "Successful detection replaces the current phase ranges."
+        )
+        self.auto_detect_phases_btn.clicked.connect(self._auto_detect_phases)
+        phase_controls.addWidget(self.auto_detect_phases_btn)
         self.export_report_btn = QPushButton("Export report table…")
         self.export_report_btn.setEnabled(False)
         self.export_report_btn.clicked.connect(self._save_report_table)
@@ -1481,6 +1544,9 @@ class CompareWindow(QWidget):
             QMessageBox.warning(self, "Load baseline", f"Failed to load CSV:\n{exc}")
             return
         self._baseline_extrema = _detected_extrema(self._baseline)
+        self._detection_metadata = None
+        self._last_detection_result = None
+        self.detection_diagnostics_btn.setEnabled(False)
         self.extrema_source_label.setText(
             "Detected from baseline tracking CSV."
             if self._baseline_extrema is not None
@@ -1490,6 +1556,7 @@ class CompareWindow(QWidget):
         self.phase_table.setRowCount(0)
         self.remove_phase_btn.setEnabled(False)
         self.export_phase_ranges_btn.setEnabled(False)
+        self.auto_detect_phases_btn.setEnabled(False)
         self.export_report_btn.setEnabled(False)
         if self._phase_region is not None:
             self.plot.removeItem(self._phase_region)
@@ -1503,6 +1570,7 @@ class CompareWindow(QWidget):
         self._phase_region.setZValue(-10)
         self.plot.addItem(self._phase_region)
         self.add_phase_btn.setEnabled(True)
+        self.auto_detect_phases_btn.setEnabled(True)
         self._align_and_redraw(estimate_offset=True)
 
     def _load_baseline_extrema(self):
@@ -1545,6 +1613,181 @@ class CompareWindow(QWidget):
     def _on_phase_label_changed(self, label):
         self.expected_cycles_spin.setValue(0)
 
+    def _auto_detect_phases(self):
+        if self._baseline is None:
+            return
+        selected_profile = next(
+            profile
+            for profile in self._treatment_profiles
+            if profile.name == self.treatment_profile_combo.currentText()
+        )
+        try:
+            result = detect_phase_ranges(
+                self._baseline["time_s"],
+                self._baseline["px"],
+                profile=selected_profile,
+                profiles=self._treatment_profiles,
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Auto Detect Phases", str(exc))
+            return
+        self._last_detection_result = result
+        self.detection_diagnostics_btn.setEnabled(True)
+        if not result.phase_ranges:
+            noise = result.noise_profile
+            rejection_summary = self._format_detection_rejections(
+                result.diagnostics
+            )
+            QMessageBox.information(
+                self,
+                "Auto Detect Phases",
+                "No complete vibration events with Phase 1, Phase 2, and Phase 3 "
+                "were detected. Existing phase ranges were kept.\n\n"
+                f"Profile: {result.profile_metadata['selected_profile']} "
+                f"(resolved as {result.profile_metadata['resolved_profile']}).\n"
+                f"Analyzed {result.cycle_count} cycles. Noise floor: RMS "
+                f"{noise['rms']:.4g}, peak-to-peak {noise['peak_to_peak']:.4g}, "
+                f"average frequency {noise['average_frequency_hz']:.3g} Hz."
+                f"{rejection_summary}",
+            )
+            return
+
+        self._phase_ranges = result.phase_ranges
+        self._detection_metadata = result.profile_metadata
+        self._refresh_phase_table()
+        self._align_and_redraw(estimate_offset=False)
+        noise = result.noise_profile
+        event_details = "; ".join(
+            f"Event {event['event']}: start {event['vibration_start_s']:.3f}s, "
+            f"Phase 2 {event['phase2_start_s']:.3f}s, "
+            f"Phase 3 {event['phase3_start_s']:.3f}s, "
+            f"validation {event['validation_confidence']:.2f}"
+            for event in result.events
+        )
+        QMessageBox.information(
+            self,
+            "Auto Detect Phases",
+            f"Detected {len(result.events)} complete vibration event(s) "
+            f"({len(result.phase_ranges)} phase ranges). The existing phase ranges "
+            "were replaced.\n\n"
+            f"Profile: {result.profile_metadata['selected_profile']} "
+            f"(resolved as {result.profile_metadata['resolved_profile']}); "
+            f"confidence {result.profile_metadata['detection_confidence']:.2f}.\n"
+            f"Noise floor: RMS {noise['rms']:.4g}, peak-to-peak "
+            f"{noise['peak_to_peak']:.4g}, average frequency "
+            f"{noise['average_frequency_hz']:.3g} Hz.\n"
+            f"{event_details}",
+        )
+
+    @staticmethod
+    def _format_detection_rejections(diagnostics):
+        counts = {}
+        for diagnostic in diagnostics:
+            for reason in diagnostic["rejection_reasons"]:
+                counts[reason] = counts.get(reason, 0) + 1
+        if not counts:
+            return "\nNo qualifying vibration candidates were found."
+        details = "; ".join(
+            f"{reason}: {count}"
+            for reason, count in sorted(
+                counts.items(), key=lambda item: (-item[1], item[0])
+            )
+        )
+        return f"\nCandidate rejection summary: {details}."
+
+    def _show_detection_diagnostics(self):
+        if self._last_detection_result is None:
+            return
+        result = self._last_detection_result
+        lines = [
+            f"Selected profile: {result.profile_metadata['selected_profile']}",
+            f"Resolved profile: {result.profile_metadata['resolved_profile']}",
+            f"Amplitude category: "
+            f"{result.profile_metadata['expected_amplitude_category']}",
+            f"Whole-waveform candidate regions: {len(result.candidate_regions)}",
+            f"Candidates evaluated: {len(result.diagnostics)}",
+            "",
+        ]
+        for index, region in enumerate(result.candidate_regions, start=1):
+            lines.append(
+                f"Region {index}: {region['start_s']:.3f}-"
+                f"{region['end_s']:.3f}s "
+                f"({region['duration_s']:.2f}s); "
+                f"peak density {region['peak_density_hz']:.3g} Hz; "
+                f"frequency {region['mean_frequency_hz']:.3g} Hz; "
+                f"periodicity {region['mean_periodicity']:.3g}; "
+                f"RMS/noise {region['maximum_rms_noise_ratio']:.3g}; "
+                f"amplitude/noise "
+                f"{region['maximum_amplitude_noise_ratio']:.3g}"
+            )
+        if result.candidate_regions:
+            lines.append("")
+        for index, candidate in enumerate(result.diagnostics, start=1):
+            status = "accepted" if candidate["passed"] else "rejected"
+            reasons = ", ".join(candidate["rejection_reasons"]) or "none"
+            checks = ", ".join(
+                f"{name}={'pass' if passed else 'fail' if passed is False else 'not evaluated'}"
+                for name, passed in candidate["qualification_checks"].items()
+            )
+            lines.append(
+                f"Candidate {index} (region "
+                f"{candidate.get('candidate_region', 'unknown')}, {status})\n"
+                f"  Cycles: {candidate['candidate_cycles']}; "
+                f"average frequency: {candidate['average_frequency_hz']:.3g} Hz; "
+                f"frequency stability: {candidate['frequency_stability']:.3g}; "
+                f"amplitude stability: {candidate['amplitude_stability']:.3g}\n"
+                f"  Average amplitude: {candidate['average_amplitude']:.3g}; "
+                f"RMS energy: {candidate['rms_energy']:.3g}; "
+                f"SNR: {candidate['signal_to_noise_ratio']:.3g}; "
+                f"minimum cycle SNR: {candidate['minimum_cycle_snr']:.3g}; "
+                f"periodicity: {candidate['periodicity_strength']:.3g}\n"
+                f"  Qualification checks: {checks}\n"
+                f"  Rejection reasons: {reasons}"
+            )
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Automatic phase detection diagnostics")
+        dialog.resize(850, 600)
+        text = QPlainTextEdit(dialog)
+        text.setReadOnly(True)
+        text.setPlainText("\n\n".join(lines))
+        buttons = QDialogButtonBox(QDialogButtonBox.Close, parent=dialog)
+        buttons.rejected.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(text)
+        layout.addWidget(buttons)
+        dialog.exec_()
+
+    def _refresh_treatment_profile_combo(self, selected_name=None):
+        if not hasattr(self, "treatment_profile_combo"):
+            return
+        selected_name = selected_name or self.treatment_profile_combo.currentText()
+        self.treatment_profile_combo.clear()
+        self.treatment_profile_combo.addItems(
+            [profile.name for profile in self._treatment_profiles]
+        )
+        if selected_name not in {
+            profile.name for profile in self._treatment_profiles
+        }:
+            selected_name = "Auto Detect"
+        self.treatment_profile_combo.setCurrentText(selected_name)
+
+    def _manage_treatment_profiles(self):
+        dialog = TreatmentProfileDialog(self._treatment_profiles, self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        profiles = dialog.profiles()
+        try:
+            save_treatment_profiles(self._detection_profile_path, profiles)
+        except (OSError, ValueError, TypeError) as exc:
+            QMessageBox.warning(
+                self, "Treatment profiles", f"Could not save profiles:\n{exc}"
+            )
+            return
+        selected_name = self.treatment_profile_combo.currentText()
+        self._treatment_profiles = profiles
+        self._refresh_treatment_profile_combo(selected_name)
+
     def _add_phase_range(self):
         if self._phase_region is None:
             return
@@ -1574,6 +1817,7 @@ class CompareWindow(QWidget):
                 "smooth": self.smooth_range_check.isChecked(),
             }
         )
+        self._detection_metadata = None
         self._phase_ranges.sort(key=lambda phase: phase["start_s"])
         self._refresh_phase_table()
         self._align_and_redraw(estimate_offset=False)
@@ -1585,6 +1829,8 @@ class CompareWindow(QWidget):
         )
         for row in selected_rows:
             del self._phase_ranges[row]
+        if selected_rows:
+            self._detection_metadata = None
         self._refresh_phase_table()
         self._align_and_redraw(estimate_offset=False)
 
@@ -2122,6 +2368,31 @@ class CompareWindow(QWidget):
         if metadata_dialog.exec_() != QDialog.Accepted:
             return
         report_metadata = metadata_dialog.metadata()
+        if self._detection_metadata is not None:
+            parameters = self._detection_metadata["parameters_used"]
+            report_metadata.update(
+                {
+                    "Detection Mode": self._detection_metadata["detection_mode"],
+                    "Selected Treatment Profile": self._detection_metadata[
+                        "selected_profile"
+                    ],
+                    "Resolved Treatment Profile": self._detection_metadata[
+                        "resolved_profile"
+                    ],
+                    "Expected Amplitude Category": self._detection_metadata[
+                        "expected_amplitude_category"
+                    ],
+                    "Profile Parameters Used": json.dumps(
+                        parameters, sort_keys=True
+                    ),
+                    "Detection Confidence": (
+                        f"{self._detection_metadata['detection_confidence']:.3f}"
+                        if self._detection_metadata["detection_confidence"]
+                        is not None
+                        else "Not available"
+                    ),
+                }
+            )
 
         offset = (
             float(self.offset_spin.value())

@@ -1,0 +1,50 @@
+[
+  {
+    "name": "Auto Detect",
+    "expected_amplitude_category": "Automatic",
+    "min_snr": 2.0,
+    "min_cycles": 5,
+    "frequency_tolerance": 0.2,
+    "amplitude_tolerance": 0.55,
+    "periodicity_threshold": 0.6,
+    "frequency_increase_ratio": 1.15,
+    "sustained_frequency_cycles": 3,
+    "quiet_hysteresis_multiple": 1.5
+  },
+  {
+    "name": "0.4 mm",
+    "expected_amplitude_category": "0.4 mm",
+    "min_snr": 0.75,
+    "min_cycles": 4,
+    "frequency_tolerance": 0.4,
+    "amplitude_tolerance": 0.85,
+    "periodicity_threshold": 0.25,
+    "frequency_increase_ratio": 1.15,
+    "sustained_frequency_cycles": 3,
+    "quiet_hysteresis_multiple": 1.5
+  },
+  {
+    "name": "0.7 mm",
+    "expected_amplitude_category": "0.7 mm",
+    "min_snr": 0.9,
+    "min_cycles": 4,
+    "frequency_tolerance": 0.4,
+    "amplitude_tolerance": 0.85,
+    "periodicity_threshold": 0.25,
+    "frequency_increase_ratio": 1.4,
+    "sustained_frequency_cycles": 3,
+    "quiet_hysteresis_multiple": 1.5
+  },
+  {
+    "name": "1.1 mm",
+    "expected_amplitude_category": "1.1 mm",
+    "min_snr": 2.0,
+    "min_cycles": 5,
+    "frequency_tolerance": 0.2,
+    "amplitude_tolerance": 0.55,
+    "periodicity_threshold": 0.6,
+    "frequency_increase_ratio": 1.15,
+    "sustained_frequency_cycles": 3,
+    "quiet_hysteresis_multiple": 1.5
+  }
+]

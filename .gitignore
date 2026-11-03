@@ -12,6 +12,7 @@ test/
 
 *.csv
 *.json
+!data/json/detection_profiles.json
 !config.example.json
 !mapping.example.json
 *plots

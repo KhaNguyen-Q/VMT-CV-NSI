@@ -944,8 +944,6 @@ class AppWindow(QWidget):
         saved = []
         if csv_path:
             saved.append(f"CSV:\n{csv_path}")
-        if png_path:
-            saved.append(f"PNG:\n{png_path}")
         detail = "\n".join(saved) if saved else "No files saved."
         QMessageBox.information(
             self,
