@@ -17,3 +17,5 @@ test/
 !mapping.example.json
 *plots
 *\docs\Improvements.md
+
+changes-week8.md

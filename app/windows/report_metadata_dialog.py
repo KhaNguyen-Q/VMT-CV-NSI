@@ -15,6 +15,7 @@ _METADATA_FIELDS = (
     "Treatment profile",
     "Device number",
     "Client Name",
+    "Date",
 )
 
 

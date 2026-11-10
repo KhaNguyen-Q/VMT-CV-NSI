@@ -21,6 +21,7 @@ from PyQt5.QtWidgets import (
     QDialog,
     QFileDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMessageBox,
     QPushButton,
@@ -40,6 +41,7 @@ try:
         save_treatment_profiles,
     )
     from automation.phase_detector import detect_phase_ranges
+    from automation.signal_features import resample_extrema_signal
 except ModuleNotFoundError:
     from app.automation.detection_profiles import (
         default_profiles_path,
@@ -48,6 +50,7 @@ except ModuleNotFoundError:
         save_treatment_profiles,
     )
     from app.automation.phase_detector import detect_phase_ranges
+    from app.automation.signal_features import resample_extrema_signal
 try:
     from windows.treatment_profile_dialog import TreatmentProfileDialog
 except ModuleNotFoundError:
@@ -61,6 +64,13 @@ from utils.utils import (
 from windows.graph_viewbox import GraphViewBox
 from windows.NSIReportformat import format_value, save_report_json, save_reports
 from windows.report_metadata_dialog import ReportMetadataDialog
+from windows.range_analysis_window import RangeAnalysisWindow
+from windows.range_csv_export import (
+    available_phases,
+    ranges_for_phase,
+    tagged_cycle_count,
+    write_range_export_csv,
+)
 
 _project_root = get_project_root(os.path.dirname(os.path.abspath(__file__)))
 _PX_TO_MM = 1.0 / 10.0
@@ -88,6 +98,7 @@ def _read_tracking_csv(path):
     times = []
     px = []
     mm = []
+    labels = []
     for row in rows:
         t = _to_float(row.get("time_s"))
         if t is None:
@@ -95,6 +106,7 @@ def _read_tracking_csv(path):
         times.append(t)
         px.append(_to_float(row.get(px_col)) if px_col else None)
         mm.append(_to_float(row.get(mm_col)) if mm_col else None)
+        labels.append((row.get("label") or "").strip().casefold())
     if len(times) < 2:
         raise ValueError("CSV needs at least two numeric time samples")
 
@@ -106,12 +118,21 @@ def _read_tracking_csv(path):
     mm_arr = np.asarray(
         [np.nan if value is None else value for value in mm], dtype=float
     )[order]
+    labels = np.asarray(labels)[order]
+    extrema_only = (
+        px_col == "position_px"
+        and np.isfinite(px_arr).all()
+        and len(labels) >= 8
+        and np.isin(labels, ("top", "bottom")).all()
+        and np.all(labels[1:] != labels[:-1])
+    )
     return {
         "name": os.path.splitext(os.path.basename(path))[0],
         "path": path,
         "time_s": times,
         "px": px_arr,
         "mm": mm_arr,
+        "extrema_only": bool(extrema_only),
     }
 
 
@@ -182,11 +203,9 @@ def _peak_to_peak_stats(extrema, start_s, end_s):
             dtype=bool,
         )
         amplitudes = amplitudes[keep]
-    top_count = sum(row["label"] == "top" for row in rows)
-    bottom_count = sum(row["label"] == "bottom" for row in rows)
     return {
         "rows": rows,
-        "cycle_count": min(top_count, bottom_count),
+        "cycle_count": tagged_cycle_count(extrema, start_s, end_s),
         "sample_count": int(amplitudes.size),
         "amplitudes": amplitudes.tolist(),
         "mean": float(np.mean(amplitudes)) if amplitudes.size else None,
@@ -1275,6 +1294,7 @@ class CompareWindow(QWidget):
         self._phase_region = None
         self._detection_metadata = None
         self._last_detection_result = None
+        self._range_analysis_window = None
         self._detection_profile_path = default_profiles_path()
         try:
             self._treatment_profiles = load_treatment_profiles(
@@ -1480,6 +1500,20 @@ class CompareWindow(QWidget):
         phase_controls.addStretch(1)
         layout.addLayout(phase_controls)
 
+        analysis_controls = QHBoxLayout()
+        self.range_analysis_btn = QPushButton("Analyze exported range CSVs…")
+        self.range_analysis_btn.setToolTip(
+            "Combine exported range CSVs and run phase, device, or "
+            "device-variability statistics."
+        )
+        self.range_analysis_btn.clicked.connect(self._open_range_analysis)
+        analysis_controls.addWidget(self.range_analysis_btn)
+        analysis_controls.addWidget(
+            QLabel("Select exported range CSVs to analyze multiple devices.")
+        )
+        analysis_controls.addStretch(1)
+        layout.addLayout(analysis_controls)
+
         self.phase_table = QTableWidget(0, 9)
         self.phase_table.setHorizontalHeaderLabels(
             [
@@ -1505,6 +1539,13 @@ class CompareWindow(QWidget):
         self.status = QLabel("Load a baseline CSV and a compare CSV.")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
+
+    def _open_range_analysis(self):
+        if self._range_analysis_window is None:
+            self._range_analysis_window = RangeAnalysisWindow(self)
+        self._range_analysis_window.show()
+        self._range_analysis_window.raise_()
+        self._range_analysis_window.activateWindow()
 
     def _csv_start_dir(self):
         folder = os.path.join(_project_root, "data", "csv") if _project_root else ""
@@ -1622,9 +1663,13 @@ class CompareWindow(QWidget):
             if profile.name == self.treatment_profile_combo.currentText()
         )
         try:
+            times = self._baseline["time_s"]
+            positions = self._baseline["px"]
+            if self._baseline.get("extrema_only", False):
+                times, positions = resample_extrema_signal(times, positions)
             result = detect_phase_ranges(
-                self._baseline["time_s"],
-                self._baseline["px"],
+                times,
+                positions,
                 profile=selected_profile,
                 profiles=self._treatment_profiles,
             )
@@ -1873,17 +1918,43 @@ class CompareWindow(QWidget):
                 self, "Export ranges", "There are no baseline ranges to export."
             )
             return
-        start = self._csv_start_dir()
+        if self._baseline is None or self._baseline_extrema is None:
+            QMessageBox.warning(
+                self,
+                "Export ranges",
+                "Load baseline tracking data with detectable peaks before exporting.",
+            )
+            return
+
+        phase_names = available_phases(self._phase_ranges)
+        phase_choices = phase_names + ["All phases"]
+        default_choice = next(
+            (
+                index
+                for index, name in enumerate(phase_names)
+                if name.casefold() == "phase 1"
+            ),
+            len(phase_choices) - 1,
+        )
+        selected_phase, accepted = QInputDialog.getItem(
+            self,
+            "Select phases",
+            "Choose which phases to include in the CSV:",
+            phase_choices,
+            default_choice,
+            False,
+        )
+        if not accepted:
+            return
+        ranges = ranges_for_phase(self._phase_ranges, selected_phase)
+
+        start_dir = self._csv_start_dir()
         default_name = (
             "comparison_ranges_report.csv"
             if self._compare is not None
             else "baseline_ranges.csv"
         )
-        suggested = (
-            os.path.join(start, default_name)
-            if start
-            else default_name
-        )
+        suggested = os.path.join(start_dir, default_name) if start_dir else default_name
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Export baseline ranges CSV",
@@ -1895,449 +1966,26 @@ class CompareWindow(QWidget):
         if not path.lower().endswith(".csv"):
             path += ".csv"
 
-        fieldnames = [
-            "baseline",
-            "compare",
-            "baseline_extrema",
-            "behavior",
-            "phase_offset_s",
-            "baseline_start_s",
-            "baseline_end_s",
-            "compare_start_s",
-            "compare_end_s",
-            "compare_coverage_start_s",
-            "compare_coverage_end_s",
-            "compare_coverage_pct",
-            "expected_cycles",
-            "baseline_cycles",
-            "compare_cycles",
-            "cycles_difference",
-            "baseline_p2p_mean_px",
-            "baseline_p2p_std_px",
-            "baseline_p2p_samples",
-            "compare_p2p_mean_px",
-            "compare_p2p_std_px",
-            "compare_p2p_samples",
-            "p2p_difference_px",
-            "p2p_difference_pct",
-            "p2p_absolute_error_px",
-            "baseline_period_mean_s",
-            "baseline_period_std_s",
-            "compare_period_mean_s",
-            "compare_period_std_s",
-            "period_difference_s",
-            "period_difference_pct",
-            "period_absolute_error_s",
-            "cycles_absolute_error",
-            "cycles_difference_pct",
-            "confirmed_outlier_count",
-            "phase_correlation",
-            "phase_weight",
-            "overall_weighted_correlation",
-            "phase_weighting",
-            "correlation_method",
-            "smooth",
-        ]
+        metadata_dialog = ReportMetadataDialog(self)
+        if metadata_dialog.exec_() != QDialog.Accepted:
+            return
         try:
-            parent = os.path.dirname(os.path.abspath(path))
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            offset = (
-                float(self.offset_spin.value())
-                if self._baseline is not None and self._compare is not None
-                else None
+            cycle_count = write_range_export_csv(
+                path,
+                ranges,
+                self._baseline_extrema["rows"],
+                self._baseline,
+                metadata_dialog.metadata(),
             )
-            compare_times = None
-            if self._compare is not None and np.isfinite(self._compare["px"]).any():
-                compare_mask = (
-                    np.isfinite(self._compare["time_s"])
-                    & np.isfinite(self._compare["px"])
-                )
-                compare_times = self._compare["time_s"][compare_mask]
-                compare_extrema_rows = (
-                    self._compare_extrema["rows"]
-                    if self._compare_extrema is not None
-                    else []
-                )
-                if compare_times.size < 2:
-                    compare_times = None
-
-            correlation_baseline_times = correlation_baseline_values = None
-            correlation_compare_times = correlation_compare_values = None
-            if self._baseline is not None and self._compare is not None:
-                position_key = "mm" if self._use_mm() else "px"
-                baseline_mask = (
-                    np.isfinite(self._baseline["time_s"])
-                    & np.isfinite(self._baseline[position_key])
-                )
-                compare_mask = (
-                    np.isfinite(self._compare["time_s"])
-                    & np.isfinite(self._compare[position_key])
-                )
-                if np.count_nonzero(baseline_mask) >= 2:
-                    correlation_baseline_times = self._baseline["time_s"][
-                        baseline_mask
-                    ]
-                    correlation_baseline_values = self._baseline[position_key][
-                        baseline_mask
-                    ]
-                if np.count_nonzero(compare_mask) >= 2:
-                    correlation_compare_times = self._compare["time_s"][
-                        compare_mask
-                    ]
-                    correlation_compare_values = self._compare[position_key][
-                        compare_mask
-                    ]
-
-            weighted_phase_samples = {}
-            if (
-                offset is not None
-                and correlation_baseline_times is not None
-                and correlation_compare_times is not None
-            ):
-                for phase in self._phase_ranges:
-                    phase_key, weight = _phase_weight(phase["label"])
-                    if phase_key is None or weight == 0:
-                        continue
-                    baseline_values, comparison_values = _aligned_phase_samples(
-                        correlation_baseline_times,
-                        correlation_baseline_values,
-                        correlation_compare_times,
-                        correlation_compare_values,
-                        offset,
-                        phase["start_s"],
-                        phase["end_s"],
-                    )
-                    if baseline_values.size == 0:
-                        continue
-                    if phase_key in weighted_phase_samples:
-                        old_weight, (old_baseline, old_comparison) = (
-                            weighted_phase_samples[phase_key]
-                        )
-                        baseline_values = np.concatenate(
-                            (old_baseline, baseline_values)
-                        )
-                        comparison_values = np.concatenate(
-                            (old_comparison, comparison_values)
-                        )
-                        weight = old_weight
-                    weighted_phase_samples[phase_key] = (
-                        weight,
-                        (baseline_values, comparison_values),
-                    )
-            overall_weighted_correlation = _weighted_correlation(
-                weighted_phase_samples
-            )
-
-            with open(path, "w", newline="", encoding="utf-8") as handle:
-                writer = csv.DictWriter(handle, fieldnames=fieldnames)
-                writer.writeheader()
-                for phase in self._phase_ranges:
-                    baseline_stats = (
-                        _peak_to_peak_stats(
-                            self._baseline_extrema["rows"],
-                            phase["start_s"],
-                            phase["end_s"],
-                        )
-                        if self._baseline_extrema is not None
-                        else None
-                    )
-                    baseline_period = (
-                        _cycle_period_stats(
-                            self._baseline_extrema["rows"],
-                            phase["start_s"],
-                            phase["end_s"],
-                        )
-                        if self._baseline_extrema is not None
-                        else None
-                    )
-                    compare_start = (
-                        phase["start_s"] - offset if offset is not None else None
-                    )
-                    compare_end = (
-                        phase["end_s"] - offset if offset is not None else None
-                    )
-                    compare_stats = compare_period = None
-                    coverage_start = coverage_end = coverage_pct = None
-                    if (
-                        compare_times is not None
-                        and compare_start is not None
-                        and compare_end is not None
-                    ):
-                        coverage_start = max(
-                            phase["start_s"], float(compare_times[0] + offset)
-                        )
-                        coverage_end = min(
-                            phase["end_s"], float(compare_times[-1] + offset)
-                        )
-                        if coverage_end > coverage_start:
-                            coverage_pct = (
-                                100.0
-                                * (coverage_end - coverage_start)
-                                / (phase["end_s"] - phase["start_s"])
-                            )
-                            compare_stats = _peak_to_peak_stats(
-                                compare_extrema_rows,
-                                compare_start,
-                                compare_end,
-                            )
-                            compare_period = _cycle_period_stats(
-                                compare_extrema_rows,
-                                compare_start,
-                                compare_end,
-                            )
-
-                    baseline_p2p = (
-                        baseline_stats["mean"]
-                        if baseline_stats is not None
-                        else None
-                    )
-                    compare_p2p = (
-                        compare_stats["mean"]
-                        if compare_stats is not None
-                        else None
-                    )
-                    p2p_difference = (
-                        compare_p2p - baseline_p2p
-                        if compare_p2p is not None and baseline_p2p is not None
-                        else None
-                    )
-                    baseline_cycles = (
-                        baseline_stats["cycle_count"]
-                        if baseline_stats is not None
-                        else None
-                    )
-                    compare_cycles = (
-                        compare_stats["cycle_count"]
-                        if compare_stats is not None
-                        else None
-                    )
-                    baseline_period_mean = (
-                        baseline_period["mean"] if baseline_period is not None else None
-                    )
-                    compare_period_mean = (
-                        compare_period["mean"] if compare_period is not None else None
-                    )
-                    period_difference = (
-                        compare_period_mean - baseline_period_mean
-                        if compare_period_mean is not None
-                        and baseline_period_mean is not None
-                        else None
-                    )
-                    cycles_difference = (
-                        compare_cycles - baseline_cycles
-                        if compare_cycles is not None and baseline_cycles is not None
-                        else None
-                    )
-                    phase_correlation = None
-                    if (
-                        offset is not None
-                        and correlation_baseline_times is not None
-                        and correlation_compare_times is not None
-                    ):
-                        phase_baseline_values, phase_compare_values = (
-                            _aligned_phase_samples(
-                                correlation_baseline_times,
-                                correlation_baseline_values,
-                                correlation_compare_times,
-                                correlation_compare_values,
-                                offset,
-                                phase["start_s"],
-                                phase["end_s"],
-                            )
-                        )
-                        phase_correlation = _pearson_correlation(
-                            phase_baseline_values, phase_compare_values
-                        )
-                    _phase_key, phase_weight = _phase_weight(phase["label"])
-                    confirmed_outlier_count = (
-                        sum(
-                            finding["tag"] == "strong_outlier"
-                            and phase["start_s"] <= finding["time_s"] <= phase["end_s"]
-                            for finding in self._outlier_rows
-                        )
-                        if self._baseline is not None and self._compare is not None
-                        else ""
-                    )
-                    writer.writerow(
-                        {
-                            "baseline": (
-                                self._baseline["name"]
-                                if self._baseline is not None
-                                else ""
-                            ),
-                            "compare": (
-                                self._compare["name"]
-                                if self._compare is not None
-                                else ""
-                            ),
-                            "baseline_extrema": (
-                                self._baseline_extrema["name"]
-                                if self._baseline_extrema is not None
-                                else ""
-                            ),
-                            "behavior": phase["label"],
-                            "phase_offset_s": offset if offset is not None else "",
-                            "baseline_start_s": phase["start_s"],
-                            "baseline_end_s": phase["end_s"],
-                            "compare_start_s": (
-                                compare_start if compare_start is not None else ""
-                            ),
-                            "compare_end_s": (
-                                compare_end if compare_end is not None else ""
-                            ),
-                            "compare_coverage_start_s": (
-                                coverage_start if coverage_start is not None else ""
-                            ),
-                            "compare_coverage_end_s": (
-                                coverage_end if coverage_end is not None else ""
-                            ),
-                            "compare_coverage_pct": (
-                                coverage_pct if coverage_pct is not None else ""
-                            ),
-                            "expected_cycles": phase["expected_cycles"],
-                            "baseline_cycles": (
-                                baseline_cycles if baseline_cycles is not None else ""
-                            ),
-                            "compare_cycles": (
-                                compare_cycles if compare_cycles is not None else ""
-                            ),
-                            "cycles_difference": (
-                                compare_cycles - baseline_cycles
-                                if compare_cycles is not None
-                                and baseline_cycles is not None
-                                else ""
-                            ),
-                            "baseline_p2p_mean_px": (
-                                baseline_p2p if baseline_p2p is not None else ""
-                            ),
-                            "baseline_p2p_std_px": (
-                                baseline_stats["std"]
-                                if baseline_stats is not None
-                                and baseline_stats["std"] is not None
-                                else ""
-                            ),
-                            "baseline_p2p_samples": (
-                                baseline_stats["sample_count"]
-                                if baseline_stats is not None
-                                else ""
-                            ),
-                            "compare_p2p_mean_px": (
-                                compare_p2p if compare_p2p is not None else ""
-                            ),
-                            "compare_p2p_std_px": (
-                                compare_stats["std"]
-                                if compare_stats is not None
-                                and compare_stats["std"] is not None
-                                else ""
-                            ),
-                            "compare_p2p_samples": (
-                                compare_stats["sample_count"]
-                                if compare_stats is not None
-                                else ""
-                            ),
-                            "p2p_difference_px": (
-                                p2p_difference if p2p_difference is not None else ""
-                            ),
-                            "p2p_difference_pct": (
-                                _relative_difference_pct(
-                                    p2p_difference, baseline_p2p
-                                )
-                                if p2p_difference is not None
-                                and baseline_p2p is not None
-                                else ""
-                            ),
-                            "p2p_absolute_error_px": (
-                                abs(p2p_difference)
-                                if p2p_difference is not None
-                                else ""
-                            ),
-                            "baseline_period_mean_s": (
-                                baseline_period["mean"]
-                                if baseline_period is not None
-                                and baseline_period["mean"] is not None
-                                else ""
-                            ),
-                            "baseline_period_std_s": (
-                                baseline_period["std"]
-                                if baseline_period is not None
-                                and baseline_period["std"] is not None
-                                else ""
-                            ),
-                            "compare_period_mean_s": (
-                                compare_period["mean"]
-                                if compare_period is not None
-                                and compare_period["mean"] is not None
-                                else ""
-                            ),
-                            "compare_period_std_s": (
-                                compare_period["std"]
-                                if compare_period is not None
-                                and compare_period["std"] is not None
-                                else ""
-                            ),
-                            "period_difference_s": (
-                                period_difference
-                                if period_difference is not None
-                                else ""
-                            ),
-                            "period_difference_pct": (
-                                _relative_difference_pct(
-                                    period_difference, baseline_period_mean
-                                )
-                                if period_difference is not None
-                                and baseline_period_mean is not None
-                                else ""
-                            ),
-                            "period_absolute_error_s": (
-                                abs(period_difference)
-                                if period_difference is not None
-                                else ""
-                            ),
-                            "cycles_absolute_error": (
-                                abs(cycles_difference)
-                                if cycles_difference is not None
-                                else ""
-                            ),
-                            "cycles_difference_pct": (
-                                _relative_difference_pct(
-                                    cycles_difference, baseline_cycles
-                                )
-                                if cycles_difference is not None
-                                and baseline_cycles is not None
-                                else ""
-                            ),
-                            "confirmed_outlier_count": confirmed_outlier_count,
-                            "phase_correlation": (
-                                phase_correlation
-                                if phase_correlation is not None
-                                else ""
-                            ),
-                            "phase_weight": phase_weight,
-                            "overall_weighted_correlation": (
-                                overall_weighted_correlation
-                                if overall_weighted_correlation is not None
-                                else ""
-                            ),
-                            "phase_weighting": (
-                                "Phase I=3; Phase II=2; Phase III=0; other=0"
-                            ),
-                            "correlation_method": (
-                                "Pearson on compare values interpolated at baseline "
-                                "times; Fisher-z aggregate weighted 3:2:0"
-                            ),
-                            "smooth": phase["smooth"],
-                        }
-                    )
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, csv.Error) as exc:
             QMessageBox.warning(
-                self, "Export baseline ranges", f"Failed to save CSV:\n{exc}"
+                self, "Export ranges", f"Failed to save CSV:\n{exc}"
             )
             return
         QMessageBox.information(
             self,
-            "Export baseline ranges",
-            f"Saved {len(self._phase_ranges)} baseline ranges:\n{path}",
+            "Export ranges",
+            f"Saved {len(ranges)} vibration ranges ({cycle_count} cycles):\n{path}",
         )
 
     def _save_report_table(self):

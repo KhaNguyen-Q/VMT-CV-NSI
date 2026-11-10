@@ -17,7 +17,12 @@ from app.automation.phase_state_machine import (
     PhaseDetectionStateMachine,
     PhaseDetectionConfig,
 )
-from app.automation.signal_features import CycleFeature, NoiseProfile, QuietInterval
+from app.automation.signal_features import (
+    CycleFeature,
+    NoiseProfile,
+    QuietInterval,
+    resample_extrema_signal,
+)
 
 
 def _recording_with_vibration(start_s=1.0, noise_seed=4):
@@ -87,6 +92,24 @@ class PhaseDetectionTests(unittest.TestCase):
                 self.assertIn("rms_energy", result.diagnostics[0])
                 self.assertIn("signal_to_noise_ratio", result.diagnostics[0])
                 self.assertIn("rejection_reasons", result.diagnostics[0])
+
+    def test_auto_profile_detects_tagged_extrema_csv(self):
+        project_root = Path(__file__).resolve().parents[1]
+        with (project_root / "data" / "csv" / "0.4secondrun.csv").open(
+            newline="", encoding="utf-8"
+        ) as handle:
+            rows = list(csv.DictReader(handle))
+        times = np.asarray([float(row["time_s"]) for row in rows])
+        positions = np.asarray([float(row["position_px"]) for row in rows])
+
+        uniform_times, uniform_positions = resample_extrema_signal(times, positions)
+        result = detect_phase_ranges(uniform_times, uniform_positions)
+
+        self.assertEqual(len(result.events), 4)
+        self.assertEqual(len(result.phase_ranges), 12)
+        self.assertEqual(
+            result.profile_metadata["expected_amplitude_category"], "0.4 mm"
+        )
 
     def test_user_selected_profile_changes_qualification_parameters(self):
         profiles = default_treatment_profiles()

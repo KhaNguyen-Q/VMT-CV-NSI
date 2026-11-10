@@ -62,6 +62,16 @@ def prepare_signal(times, positions):
     return times, positions
 
 
+def resample_extrema_signal(times, positions):
+    """Interpolate tagged extrema onto an estimated uniform source-sample grid."""
+    times, positions = prepare_signal(times, positions)
+    intervals = np.diff(times)
+    sample_interval = float(np.percentile(intervals, 10))
+    sample_count = int(round((times[-1] - times[0]) / sample_interval)) + 1
+    uniform_times = np.linspace(times[0], times[-1], sample_count)
+    return uniform_times, np.interp(uniform_times, times, positions)
+
+
 def rolling_window_statistics(times, positions, window_size, step):
     windows = []
     for start in range(0, positions.size - window_size + 1, step):
