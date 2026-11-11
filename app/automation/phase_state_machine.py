@@ -27,6 +27,7 @@ class PhaseDetectionConfig:
     sustained_frequency_cycles: int = 3
     quiet_hysteresis_multiple: float = 1.5
     minimum_rest_seconds: float = 0.5
+    phase3_rest_minimum_seconds: float = 0.4
     noise_window_seconds: float = 0.5
     noise_quiet_fraction: float = 0.2
     cycle_smoothing_seconds: float = 0.02
@@ -51,6 +52,7 @@ class PhaseDetectionConfig:
             raise ValueError("quiet_hysteresis_multiple must be greater than one")
         if (
             self.minimum_rest_seconds <= 0
+            or self.phase3_rest_minimum_seconds <= 0
             or self.noise_window_seconds <= 0
             or self.cycle_smoothing_seconds <= 0
             or self.minimum_peak_distance_seconds <= 0
@@ -314,7 +316,7 @@ class PhaseDetectionStateMachine:
         if interval.start_s <= self.current_event.phase2_start_s:
             return
         minimum_rest = max(
-            self.config.minimum_rest_seconds,
+            self.config.phase3_rest_minimum_seconds,
             2.0 / self.current_event.phase1_frequency_hz,
         )
         if interval.end_s - interval.start_s < minimum_rest:

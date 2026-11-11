@@ -21,8 +21,11 @@ from app.automation.signal_features import (
     CycleFeature,
     NoiseProfile,
     QuietInterval,
+    find_energy_decay_interval,
     resample_extrema_signal,
 )
+from app.utils.utils import find_peak_to_peak_extrema
+from app.windows.range_csv_export import tagged_cycle_count
 
 
 def _recording_with_vibration(start_s=1.0, noise_seed=4):
@@ -176,6 +179,138 @@ class PhaseDetectionTests(unittest.TestCase):
         self.assertAlmostEqual(result.events[-1]["vibration_start_s"], 7.771, delta=0.1)
         self.assertAlmostEqual(result.events[-1]["phase3_end_s"], times[-1])
 
+    def test_fsm_restores_frequency_threshold_transition_on_t1(self):
+        recording_path = (
+            Path(__file__).resolve().parents[1]
+            / "data"
+            / "csv"
+            / "Testprofileoutputcsv"
+            / "T1test.csv"
+        )
+        with recording_path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        times = np.asarray([float(row["time_s"]) for row in rows])
+        positions = np.asarray([float(row["y_px"]) for row in rows])
+
+        result = detect_phase_ranges(times, positions)
+
+        self.assertAlmostEqual(
+            result.events[0]["vibration_start_s"], 1.1106, delta=0.02
+        )
+        self.assertAlmostEqual(
+            result.events[0]["phase2_start_s"], 2.3014, delta=0.02
+        )
+        extrema = find_peak_to_peak_extrema(times, positions)
+        old_cycle_count = tagged_cycle_count(
+            extrema, result.phase_ranges[0]["start_s"], 2.3014316860465116
+        )
+        detected_cycle_count = tagged_cycle_count(
+            extrema,
+            result.phase_ranges[0]["start_s"],
+            result.phase_ranges[0]["end_s"],
+        )
+        self.assertEqual(old_cycle_count, 38)
+        self.assertEqual(detected_cycle_count, 38)
+        self.assertEqual(result.profile_metadata["detection_method"], "FSM")
+
+    def test_fsm_splits_c2_events_at_short_quiet_rest_intervals(self):
+        recording_path = (
+            Path(__file__).resolve().parents[1]
+            / "data"
+            / "csv"
+            / "Testprofileoutputcsv"
+            / "Testoutputv2"
+            / "C2-leftflashv2.csv"
+        )
+        with recording_path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        times = np.asarray([float(row["time_s"]) for row in rows])
+        positions = np.asarray([float(row["y_px"]) for row in rows])
+
+        result = detect_phase_ranges(times, positions, method="FSM")
+
+        self.assertEqual(len(result.events), 5)
+        self.assertEqual(len(result.phase_ranges), 15)
+        self.assertAlmostEqual(result.events[0]["vibration_start_s"], 2.237, delta=0.03)
+        self.assertAlmostEqual(result.events[0]["phase2_start_s"], 2.903, delta=0.05)
+        self.assertEqual(result.events[0]["phase1_cycles"], 11)
+        for event in result.events:
+            self.assertLess(
+                event["phase3_start_s"] - event["phase2_start_s"],
+                1.2,
+            )
+            self.assertGreater(
+                event["phase3_start_s"], event["phase2_start_s"]
+            )
+        self.assertEqual(
+            [phase["label"] for phase in result.phase_ranges],
+            ["Phase 1", "Phase 2", "Phase 3"] * 5,
+        )
+
+    def test_signals_method_uses_trends_and_energy_decay_on_t1(self):
+        recording_path = (
+            Path(__file__).resolve().parents[1]
+            / "data"
+            / "csv"
+            / "Testprofileoutputcsv"
+            / "T1test.csv"
+        )
+        with recording_path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        times = np.asarray([float(row["time_s"]) for row in rows])
+        positions = np.asarray([float(row["y_px"]) for row in rows])
+
+        result = detect_phase_ranges(times, positions, method="Signals")
+
+        self.assertEqual(result.profile_metadata["detection_method"], "Signals")
+        self.assertEqual(len(result.events), 2)
+        self.assertAlmostEqual(result.events[0]["vibration_start_s"], 1.1106, delta=0.02)
+        self.assertAlmostEqual(result.events[0]["phase2_start_s"], 1.8634, delta=0.1)
+        self.assertGreater(result.events[0]["phase3_start_s"], 2.3)
+        trend_diagnostics = [
+            diagnostic
+            for diagnostic in result.diagnostics
+            if "frequency_slope" in diagnostic
+        ]
+        self.assertTrue(trend_diagnostics)
+        for field in (
+            "frequency_slope",
+            "frequency_cv",
+            "rolling_frequency_ratio",
+            "amplitude_slope",
+            "amplitude_cv",
+            "energy_slope",
+            "transition_score",
+            "phase1_confidence",
+            "phase2_confidence",
+            "phase3_confidence",
+        ):
+            self.assertIn(field, trend_diagnostics[0])
+
+    def test_signals_method_detects_repeated_events_in_one_candidate_region(self):
+        recording_path = (
+            Path(__file__).resolve().parents[1]
+            / "data"
+            / "csv"
+            / "Baseline0.7.csv"
+        )
+        with recording_path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        times = np.asarray([float(row["time_s"]) for row in rows])
+        positions = np.asarray([float(row["y_px"]) for row in rows])
+
+        result = detect_phase_ranges(times, positions, method="Signals")
+
+        self.assertEqual(len(result.candidate_regions), 1)
+        self.assertEqual(len(result.events), 6)
+        self.assertEqual(len(result.phase_ranges), 18)
+
+    def test_unknown_detection_method_is_rejected(self):
+        times, positions = _recording_with_vibration()
+
+        with self.assertRaisesRegex(ValueError, "Detection method"):
+            detect_phase_ranges(times, positions, method="Other")
+
     def test_first_candidate_can_qualify_at_the_recording_start(self):
         machine = PhaseDetectionStateMachine(
             NoiseProfile(
@@ -245,6 +380,37 @@ class PhaseDetectionTests(unittest.TestCase):
         self.assertEqual(events[0].phase3_start_s, 4.5)
         self.assertEqual(events[0].end_s, 4.9)
         self.assertEqual(machine.state, DetectionState.PHASE_3)
+
+    def test_energy_decay_finds_a_rest_relative_to_phase_two_energy(self):
+        sample_rate = 100.0
+        times = np.arange(0.0, 3.0, 1.0 / sample_rate)
+        positions = np.zeros_like(times)
+        phase2 = (times >= 0.5) & (times < 1.5)
+        positions[phase2] = 5.0 * np.sin(
+            2.0 * np.pi * 12.0 * (times[phase2] - 0.5)
+        )
+        rest = times >= 1.5
+        positions[rest] = 0.5 * np.sin(
+            2.0 * np.pi * 12.0 * (times[rest] - 1.5)
+        )
+        noise = NoiseProfile(
+            rms=0.1,
+            peak_to_peak=0.4,
+            standard_deviation=0.1,
+            average_frequency_hz=0.0,
+        )
+
+        interval = find_energy_decay_interval(
+            times,
+            positions,
+            noise,
+            phase2_start_s=0.5,
+            minimum_duration=0.3,
+        )
+
+        self.assertIsNotNone(interval)
+        self.assertAlmostEqual(interval.start_s, 1.5, delta=0.1)
+        self.assertGreaterEqual(interval.end_s - interval.start_s, 0.3)
 
     def test_detects_compatible_phase_ranges_for_report_workflow(self):
         times, positions = _recording_with_vibration()

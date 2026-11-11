@@ -1,6 +1,7 @@
 """Public automatic phase-detection entry point."""
 
 from dataclasses import asdict, dataclass, replace
+import heapq
 import logging
 
 import numpy as np
@@ -12,10 +13,16 @@ from .detection_profiles import (
     resolve_treatment_profile,
 )
 from .event_regions import detect_candidate_regions
-from .phase_state_machine import PhaseDetectionConfig, PhaseDetectionStateMachine
+from .phase_state_machine import (
+    DetectionState,
+    PhaseDetectionConfig,
+    PhaseDetectionStateMachine,
+)
+from .signals_phase_detector import detect_signals_events
 from .signal_features import (
     estimate_noise_profile,
     extract_cycles,
+    find_energy_decay_interval,
     find_quiet_intervals,
     prepare_signal,
 )
@@ -34,8 +41,17 @@ class PhaseDetectionResult:
     profile_metadata: dict
 
 
-def detect_phase_ranges(times, positions, config=None, profile=None, profiles=None):
+def detect_phase_ranges(
+    times,
+    positions,
+    config=None,
+    profile=None,
+    profiles=None,
+    method="FSM",
+):
     """Detect complete Phase 1/2/3 ranges in a baseline displacement signal."""
+    if method not in ("FSM", "Signals"):
+        raise ValueError("Detection method must be 'FSM' or 'Signals'")
     base_config = config or PhaseDetectionConfig()
     profiles = list(profiles or default_treatment_profiles())
     if profile is None:
@@ -110,31 +126,98 @@ def detect_phase_ranges(times, positions, config=None, profile=None, profiles=No
             for interval in quiet_intervals
             if region.start_s <= interval.start_s < region.end_s
         ]
-        machine = PhaseDetectionStateMachine(noise, profile_config)
-        evidence = [
-            (cycle.end_s, 0, cycle) for cycle in region_cycles
-        ] + [
-            (interval.end_s, 1, interval) for interval in region_quiet_intervals
-        ]
-        for _confirmed_at, evidence_order, item in sorted(
-            evidence, key=lambda entry: (entry[0], entry[1])
-        ):
-            if evidence_order == 0:
-                machine.process_cycle(item)
-            else:
-                machine.process_quiet_interval(item)
+        if method == "Signals":
+            region_events, region_diagnostics = detect_signals_events(
+                times,
+                positions,
+                region,
+                region_cycles,
+                noise,
+                profile_config,
+            )
+            detected_events.extend(region_events)
+        else:
+            machine = PhaseDetectionStateMachine(noise, profile_config)
+            evidence = [
+                (cycle.end_s, 0, index, "cycle", cycle)
+                for index, cycle in enumerate(region_cycles)
+            ] + [
+                (
+                    interval.end_s,
+                    1,
+                    len(region_cycles) + index,
+                    "quiet",
+                    interval,
+                )
+                for index, interval in enumerate(region_quiet_intervals)
+            ]
+            heapq.heapify(evidence)
+            next_evidence_index = len(evidence)
+            energy_quiet_intervals = []
+            while evidence:
+                confirmed_at, _order, _evidence_index, evidence_type, item = (
+                    heapq.heappop(evidence)
+                )
+                if evidence_type == "cycle":
+                    previous_state = machine.state
+                    machine.process_cycle(item)
+                    if (
+                        previous_state is DetectionState.PHASE_1
+                        and machine.state is DetectionState.PHASE_2
+                    ):
+                        event = machine.current_event
+                        if event is None or event.phase2_start_s is None:
+                            continue
+                        minimum_rest = max(
+                            profile_config.phase3_rest_minimum_seconds,
+                            2.0 / event.phase1_frequency_hz,
+                        )
+                        energy_interval = find_energy_decay_interval(
+                            times,
+                            positions,
+                            noise,
+                            event.phase2_start_s,
+                            minimum_duration=minimum_rest,
+                            terminal_rest_minimum_seconds=(
+                                profile_config.terminal_rest_minimum_seconds
+                            ),
+                        )
+                        if (
+                            energy_interval is not None
+                            and energy_interval.start_s > event.phase2_start_s
+                            and energy_interval.end_s > confirmed_at
+                        ):
+                            energy_quiet_intervals.append(energy_interval)
+                            heapq.heappush(
+                                evidence,
+                                (
+                                    energy_interval.end_s,
+                                    2,
+                                    next_evidence_index,
+                                    "quiet",
+                                    energy_interval,
+                                ),
+                            )
+                            next_evidence_index += 1
+                else:
+                    machine.process_quiet_interval(item)
 
-        terminal_quiet_interval = (
-            max(region_quiet_intervals, key=lambda interval: interval.end_s)
-            if region_quiet_intervals
-            else None
-        )
-        region_events = machine.finish(
-            region.end_s,
-            terminal_quiet_interval=terminal_quiet_interval,
-        )
-        detected_events.extend(region_events)
-        for candidate in machine.candidate_diagnostics:
+            terminal_quiet_interval = (
+                max(
+                    region_quiet_intervals + energy_quiet_intervals,
+                    key=lambda interval: interval.end_s,
+                )
+                if region_quiet_intervals or energy_quiet_intervals
+                else None
+            )
+            region_events = machine.finish(
+                region.end_s,
+                terminal_quiet_interval=terminal_quiet_interval,
+            )
+            detected_events.extend(region_events)
+            region_diagnostics = machine.candidate_diagnostics
+
+        for candidate in region_diagnostics:
             candidate["candidate_region"] = region_index
             candidate_diagnostics.append(candidate)
             _logger.debug(
@@ -290,6 +373,7 @@ def detect_phase_ranges(times, positions, config=None, profile=None, profiles=No
 
     selected_profile_is_auto = profile.name == "Auto Detect"
     profile_metadata = {
+        "detection_method": method,
         "detection_mode": (
             "Automatic amplitude classification"
             if selected_profile_is_auto

@@ -1426,6 +1426,14 @@ class CompareWindow(QWidget):
         layout.addLayout(extrema_controls)
 
         profile_controls = QHBoxLayout()
+        profile_controls.addWidget(QLabel("Detection method:"))
+        self.detection_method_combo = QComboBox()
+        self.detection_method_combo.addItems(["FSM", "Signals"])
+        self.detection_method_combo.setToolTip(
+            "FSM uses the existing finite-state detector. Signals uses rolling "
+            "cycle trends and energy decay."
+        )
+        profile_controls.addWidget(self.detection_method_combo)
         profile_controls.addWidget(QLabel("Treatment profile:"))
         self.treatment_profile_combo = QComboBox()
         self._refresh_treatment_profile_combo()
@@ -1672,6 +1680,7 @@ class CompareWindow(QWidget):
                 positions,
                 profile=selected_profile,
                 profiles=self._treatment_profiles,
+                method=self.detection_method_combo.currentText(),
             )
         except ValueError as exc:
             QMessageBox.warning(self, "Auto Detect Phases", str(exc))
@@ -1688,6 +1697,7 @@ class CompareWindow(QWidget):
                 "Auto Detect Phases",
                 "No complete vibration events with Phase 1, Phase 2, and Phase 3 "
                 "were detected. Existing phase ranges were kept.\n\n"
+                f"Detection method: {result.profile_metadata['detection_method']}.\n"
                 f"Profile: {result.profile_metadata['selected_profile']} "
                 f"(resolved as {result.profile_metadata['resolved_profile']}).\n"
                 f"Analyzed {result.cycle_count} cycles. Noise floor: RMS "
@@ -1715,6 +1725,7 @@ class CompareWindow(QWidget):
             f"Detected {len(result.events)} complete vibration event(s) "
             f"({len(result.phase_ranges)} phase ranges). The existing phase ranges "
             "were replaced.\n\n"
+            f"Detection method: {result.profile_metadata['detection_method']}.\n"
             f"Profile: {result.profile_metadata['selected_profile']} "
             f"(resolved as {result.profile_metadata['resolved_profile']}); "
             f"confidence {result.profile_metadata['detection_confidence']:.2f}.\n"
@@ -1745,6 +1756,7 @@ class CompareWindow(QWidget):
             return
         result = self._last_detection_result
         lines = [
+            f"Detection method: {result.profile_metadata['detection_method']}",
             f"Selected profile: {result.profile_metadata['selected_profile']}",
             f"Resolved profile: {result.profile_metadata['resolved_profile']}",
             f"Amplitude category: "
@@ -1771,7 +1783,12 @@ class CompareWindow(QWidget):
             status = "accepted" if candidate["passed"] else "rejected"
             reasons = ", ".join(candidate["rejection_reasons"]) or "none"
             checks = ", ".join(
-                f"{name}={'pass' if passed else 'fail' if passed is False else 'not evaluated'}"
+                (
+                    f"{name}={passed:.3g}"
+                    if isinstance(passed, (int, float))
+                    and not isinstance(passed, bool)
+                    else f"{name}={'pass' if passed else 'fail' if passed is False else 'not evaluated'}"
+                )
                 for name, passed in candidate["qualification_checks"].items()
             )
             lines.append(
@@ -1789,6 +1806,21 @@ class CompareWindow(QWidget):
                 f"  Qualification checks: {checks}\n"
                 f"  Rejection reasons: {reasons}"
             )
+            if "frequency_slope" in candidate:
+                lines.append(
+                    f"  Trend: frequency slope {candidate['frequency_slope']:.3g} "
+                    f"Hz/s (CV {candidate['frequency_cv']:.3g}, "
+                    f"rolling ratio {candidate['rolling_frequency_ratio']:.3g}); "
+                    f"amplitude slope {candidate['amplitude_slope']:.3g} px/s "
+                    f"(CV {candidate['amplitude_cv']:.3g}); "
+                    f"energy slope {candidate['energy_slope']:.3g} px/s; "
+                    f"transition score {candidate['transition_score']:.3g}; "
+                    f"phase confidences "
+                    f"I {candidate['phase1_confidence']:.3g}, "
+                    f"II {candidate['phase2_confidence']:.3g}, "
+                    f"III {candidate['phase3_confidence']:.3g}; "
+                    f"stable Phase 1 windows {candidate['stable_phase1_windows']}"
+                )
         dialog = QDialog(self)
         dialog.setWindowTitle("Automatic phase detection diagnostics")
         dialog.resize(850, 600)
@@ -2020,6 +2052,9 @@ class CompareWindow(QWidget):
             parameters = self._detection_metadata["parameters_used"]
             report_metadata.update(
                 {
+                    "Detection Method": self._detection_metadata[
+                        "detection_method"
+                    ],
                     "Detection Mode": self._detection_metadata["detection_mode"],
                     "Selected Treatment Profile": self._detection_metadata[
                         "selected_profile"

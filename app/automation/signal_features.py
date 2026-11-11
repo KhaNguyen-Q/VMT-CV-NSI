@@ -259,3 +259,71 @@ def find_quiet_intervals(
             )
             start_index = None
     return intervals
+
+
+def find_energy_decay_interval(
+    times,
+    positions,
+    noise_profile,
+    phase2_start_s,
+    *,
+    window_seconds=0.3,
+    decay_ratio=0.2,
+    minimum_duration=0.3,
+    terminal_rest_minimum_seconds=0.25,
+):
+    """Find the first sustained energy drop relative to early Phase 2 energy."""
+    times, positions = prepare_signal(times, positions)
+    sample_interval = float(np.median(np.diff(times)))
+    window_size = min(
+        positions.size,
+        max(8, int(round(window_seconds / sample_interval))),
+    )
+    step = max(1, window_size // 4)
+    windows = rolling_window_statistics(times, positions, window_size, step)
+    phase2_energy_windows = [
+        rms
+        for start, _end, rms, _std, _peak_to_peak in windows
+        if phase2_start_s <= times[start] <= phase2_start_s + 1.0
+    ]
+    if not phase2_energy_windows:
+        return None
+
+    phase2_peak_energy = max(phase2_energy_windows)
+    energy_threshold = max(
+        noise_profile.rms * 1.1,
+        phase2_peak_energy * decay_ratio,
+        np.finfo(float).eps,
+    )
+    low_energy = [
+        (start, end)
+        for start, end, rms, _std, _peak_to_peak in windows
+        if times[start] >= phase2_start_s + window_seconds
+        and rms <= energy_threshold
+    ]
+    if not low_energy:
+        return None
+
+    runs = []
+    run_start, previous_end = low_energy[0]
+    for start, end in low_energy[1:]:
+        if start > previous_end + step:
+            runs.append((run_start, previous_end))
+            run_start = start
+        previous_end = end
+    runs.append((run_start, previous_end))
+
+    for start, end in runs:
+        duration = float(times[end] - times[start])
+        reaches_recording_end = times.size - 1 - end <= step
+        minimum_run = (
+            terminal_rest_minimum_seconds
+            if reaches_recording_end
+            else minimum_duration
+        )
+        if duration >= minimum_run:
+            return QuietInterval(
+                start_s=float(times[start]),
+                end_s=float(times[end]),
+            )
+    return None
