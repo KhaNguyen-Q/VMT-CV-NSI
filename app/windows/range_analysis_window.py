@@ -7,6 +7,7 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QComboBox,
     QLabel,
+    QLineEdit,
     QListWidget,
     QMessageBox,
     QPushButton,
@@ -17,13 +18,7 @@ from PyQt5.QtCore import Qt
 
 from analysis.loader import load_range_csvs
 from analysis.runner import run_all_analyses
-
-
-TREATMENT_PROFILES = (
-    "Treatment profile 1",
-    "Treatment profile 2",
-    "Treatment profile 3",
-)
+from analysis.treatment_profiles import TREATMENT_PROFILES
 
 
 class RangeAnalysisWindow(QWidget):
@@ -42,6 +37,8 @@ class RangeAnalysisWindow(QWidget):
             self.treatment_profile_combo.addItem(
                 treatment_profile, treatment_profile
             )
+        self.output_name_input = QLineEdit("analysis_output", self)
+        self.output_name_input.setPlaceholderText("Enter a name for this analysis run")
         self.output_label = QLabel("Output folder: not selected", self)
         self.status_label = QLabel(
             "Select exported range CSV files or a folder containing them.", self
@@ -67,6 +64,10 @@ class RangeAnalysisWindow(QWidget):
         treatment_profile_controls.addWidget(QLabel("Treatment profile:", self))
         treatment_profile_controls.addWidget(self.treatment_profile_combo)
 
+        output_name_controls = QHBoxLayout()
+        output_name_controls.addWidget(QLabel("Analysis folder name:", self))
+        output_name_controls.addWidget(self.output_name_input)
+
         layout = QVBoxLayout(self)
         layout.addLayout(treatment_profile_controls)
         layout.addWidget(QLabel("Input CSV files:", self))
@@ -74,6 +75,7 @@ class RangeAnalysisWindow(QWidget):
         layout.addWidget(self.file_list)
         layout.addWidget(select_output_button)
         layout.addWidget(self.output_label)
+        layout.addLayout(output_name_controls)
         layout.addWidget(run_button)
         layout.addWidget(self.status_label)
 
@@ -142,13 +144,31 @@ class RangeAnalysisWindow(QWidget):
             )
             return
 
-        run_dir = os.path.join(self._output_dir, f"{treatment_profile} output")
+        folder_name = self.output_name_input.text().strip()
+        if (
+            not folder_name
+            or folder_name in (".", "..")
+            or os.path.basename(folder_name) != folder_name
+            or any(character in folder_name for character in '<>:"/\\|?*')
+            or folder_name.endswith((".", " "))
+        ):
+            QMessageBox.information(
+                self,
+                "Analysis",
+                "Enter a valid folder name without a path or reserved characters.",
+            )
+            self.output_name_input.setFocus()
+            return
+
+        run_dir = os.path.join(self._output_dir, folder_name)
         if os.path.exists(run_dir):
             QMessageBox.information(
                 self,
                 "Analysis folder exists",
-                "Choose a new folder name so existing analysis results are not overwritten.",
+                "Choose a different folder name so existing analysis results are not overwritten.",
             )
+            self.output_name_input.setFocus()
+            self.output_name_input.selectAll()
             return
 
         try:
@@ -172,6 +192,7 @@ class RangeAnalysisWindow(QWidget):
             self,
             "Analysis complete",
             f"Saved all three analyses:\n{run_dir}\n\n"
+            f"Comparator configuration:\n{outputs['comparator_config']}\n\n"
             f"CSV tables: {len(outputs['csv_files'])}\n"
             f"Visualizations: {len(outputs['plots'])}",
         )

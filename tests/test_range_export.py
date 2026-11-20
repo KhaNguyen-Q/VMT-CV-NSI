@@ -89,6 +89,72 @@ class RangeExportTests(unittest.TestCase):
         self.assertEqual(rows[1]["High Peak (mm)"], "3.000")
         self.assertEqual(rows[1]["Low Peak (mm)"], "-1.000")
 
+    def test_phase_one_summary_starts_at_first_cycle_peak(self):
+        phase = [{"label": "Phase 1", "start_s": 0.5, "end_s": 4.0}]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "ranges.csv"
+            write_range_export_csv(
+                path, phase, self.extrema, self.baseline, self.metadata
+            )
+            with path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(rows[0]["Cycle Start (s)"], "START (2.000)")
+        self.assertEqual(rows[1]["Cycle Start (s)"], "2.000")
+
+    def test_all_phases_share_a_vibration_number_for_each_phase_sequence(self):
+        ranges = [
+            {"label": label, "start_s": 0.0, "end_s": 1.0}
+            for label in (
+                "Phase 1",
+                "Phase 2",
+                "Phase 3",
+                "Phase 1",
+                "Phase 2",
+                "Phase 3",
+            )
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "ranges.csv"
+            write_range_export_csv(
+                path, ranges, [], self.baseline, self.metadata
+            )
+            with path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(
+            [(row["Phase"], row["Vibration"]) for row in rows],
+            [
+                ("Phase 1", "Vibration 1"),
+                ("Phase 2", "Vibration 1"),
+                ("Phase 3", "Vibration 1"),
+                ("Phase 1", "Vibration 2"),
+                ("Phase 2", "Vibration 2"),
+                ("Phase 3", "Vibration 2"),
+            ],
+        )
+
+    def test_repeated_single_phase_ranges_keep_separate_vibration_numbers(self):
+        ranges = [
+            {"label": "Phase 2", "start_s": 0.0, "end_s": 1.0}
+            for _ in range(3)
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "ranges.csv"
+            write_range_export_csv(
+                path, ranges, [], self.baseline, self.metadata
+            )
+            with path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(
+            [row["Vibration"] for row in rows],
+            ["Vibration 1", "Vibration 2", "Vibration 3"],
+        )
+
     def test_exports_the_trailing_tagged_cycle_to_the_range_end(self):
         extrema = [
             {"time_s": 0.0, "label": "top"},

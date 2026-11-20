@@ -4,14 +4,15 @@ import os
 
 import pandas as pd
 
-from analysis.loader import NUMERIC_COLUMNS
+from analysis.comparator_config import generate_comparator_config
+from analysis.loader import CYCLE_DETAIL_NUMERIC_COLUMNS, NUMERIC_COLUMNS
 from analysis.plots import (
     save_device_mean_plots,
     save_group_boxplots,
     save_group_histograms,
 )
 from analysis.statistics import (
-    acceptance_ranges,
+    save_ranges,
     save_statistics,
     summarize_groups,
     summarize_values,
@@ -22,19 +23,61 @@ PHASE_ANALYSIS = "Phase Analysis"
 DEVICE_ANALYSIS = "Device-Level Analysis"
 VARIABILITY_ANALYSIS = "Device-Variability Analysis"
 ANALYSES = (PHASE_ANALYSIS, DEVICE_ANALYSIS, VARIABILITY_ANALYSIS)
+ALL_VIBRATIONS = "All Vibrations"
 
 
-def _summary_rows(master_df):
-    if "Record Type" not in master_df:
-        return master_df
-    summaries = master_df[
-        master_df["Record Type"].astype(str).str.casefold() == "phase summary"
-    ].copy()
-    if summaries.empty:
+def _analysis_rows(master_df):
+    data = master_df.copy()
+    if "Record Type" not in data:
+        data["Record Type"] = "Phase Summary"
+    if "Vibration" not in data:
+        data["Vibration"] = ALL_VIBRATIONS
+    if not data["Record Type"].astype(str).str.casefold().eq("phase summary").any():
         raise ValueError("The master dataset contains no Phase Summary rows.")
-    for column in NUMERIC_COLUMNS:
-        summaries[column] = pd.to_numeric(summaries[column], errors="coerce")
-    return summaries
+    for column in CYCLE_DETAIL_NUMERIC_COLUMNS:
+        if column not in data:
+            data[column] = float("nan")
+        data[column] = pd.to_numeric(data[column], errors="coerce")
+    return data
+
+
+def _summary_rows(data):
+    return data[
+        data["Record Type"].astype(str).str.casefold() == "phase summary"
+    ].copy()
+
+
+def _summarize_records_by_vibration(data, group_columns):
+    outputs = []
+    for record_type in ("Phase Summary", "Cycle Detail"):
+        records = data[
+            data["Record Type"].astype(str).str.casefold()
+            == record_type.casefold()
+        ]
+        if records.empty:
+            continue
+
+        measurements = (
+            NUMERIC_COLUMNS
+            if record_type == "Phase Summary"
+            else CYCLE_DETAIL_NUMERIC_COLUMNS
+        )
+        all_vibration_summary = summarize_groups(
+            records, group_columns, measurement_columns=measurements
+        )
+        all_vibration_summary["Vibration"] = ALL_VIBRATIONS
+        all_vibration_summary["Record Type"] = record_type
+        outputs.append(all_vibration_summary)
+
+        vibration_summary = summarize_groups(
+            records,
+            (*group_columns, "Vibration"),
+            measurement_columns=measurements,
+        )
+        vibration_summary["Record Type"] = record_type
+        outputs.append(vibration_summary)
+
+    return pd.concat(outputs, ignore_index=True)
 
 
 def _plots_directory(output_dir, analysis):
@@ -47,8 +90,15 @@ def _run_device_analysis_outputs(summary, output_dir):
     path = os.path.join(output_dir, "device_level_statistics.csv")
     save_statistics(summary, path)
     outputs["csv_files"].append(path)
+    ranges_path = os.path.join(output_dir, "device_level_ranges.csv")
+    save_ranges(summary, ranges_path)
+    outputs["csv_files"].append(ranges_path)
+    plot_summary = summary[
+        (summary["Record Type"] == "Phase Summary")
+        & (summary["Vibration"] == ALL_VIBRATIONS)
+    ]
     outputs["plots"] = save_device_mean_plots(
-        summary, _plots_directory(output_dir, DEVICE_ANALYSIS)
+        plot_summary, _plots_directory(output_dir, DEVICE_ANALYSIS)
     )
     return outputs
 
@@ -57,15 +107,23 @@ def _run_variability_analysis_outputs(device_summary, output_dir):
     outputs = {"csv_files": [], "plots": []}
     variability_rows = []
     for keys, group in device_summary.groupby(
-        ["Treatment profile", "Phase", "Measurement"],
+        [
+            "Treatment profile",
+            "Vibration",
+            "Record Type",
+            "Phase",
+            "Measurement",
+        ],
         dropna=False,
         sort=True,
     ):
         variability_rows.append(
             {
                 "Treatment profile": keys[0],
-                "Phase": keys[1],
-                "Measurement": keys[2],
+                "Vibration": keys[1],
+                "Record Type": keys[2],
+                "Phase": keys[3],
+                "Measurement": keys[4],
                 **summarize_values(group["mean"], population=True),
             }
         )
@@ -74,10 +132,14 @@ def _run_variability_analysis_outputs(device_summary, output_dir):
         output_dir, "device_variability_statistics.csv"
     )
     save_statistics(variability, variability_path)
-    ranges_path = os.path.join(output_dir, "acceptance_range_candidates.csv")
-    save_statistics(acceptance_ranges(variability), ranges_path)
+    ranges_path = os.path.join(output_dir, "device_variability_ranges.csv")
+    save_ranges(variability, ranges_path)
     outputs["csv_files"].extend([variability_path, ranges_path])
-    plot_data = device_summary.pivot_table(
+    plot_summary = device_summary[
+        (device_summary["Record Type"] == "Phase Summary")
+        & (device_summary["Vibration"] == ALL_VIBRATIONS)
+    ]
+    plot_data = plot_summary.pivot_table(
         index=["Treatment profile", "Device number", "Phase"],
         columns="Measurement",
         values="mean",
@@ -103,24 +165,30 @@ def _run_variability_analysis_outputs(device_summary, output_dir):
 
 
 def _run_analysis_outputs(master_df, analysis, output_dir, device_summary=None):
-    data = _summary_rows(master_df)
+    data = _analysis_rows(master_df)
+    summaries = _summary_rows(data)
     outputs = {"csv_files": [], "plots": []}
 
     if analysis == PHASE_ANALYSIS:
-        summary = summarize_groups(data, ("Treatment profile", "Phase"))
+        summary = _summarize_records_by_vibration(
+            data, ("Treatment profile", "Phase")
+        )
         path = os.path.join(output_dir, "phase_population_statistics.csv")
         save_statistics(summary, path)
         outputs["csv_files"].append(path)
+        ranges_path = os.path.join(output_dir, "phase_population_ranges.csv")
+        save_ranges(summary, ranges_path)
+        outputs["csv_files"].append(ranges_path)
         plots_dir = _plots_directory(output_dir, PHASE_ANALYSIS)
         outputs["plots"] = save_group_boxplots(
-            data,
+            summaries,
             ("Treatment profile", "Phase"),
             plots_dir,
             "phase_population",
         )
         outputs["plots"].extend(
             save_group_histograms(
-                data,
+                summaries,
                 ("Treatment profile", "Phase"),
                 plots_dir,
                 "phase_distribution",
@@ -128,7 +196,7 @@ def _run_analysis_outputs(master_df, analysis, output_dir, device_summary=None):
         )
     elif analysis == DEVICE_ANALYSIS:
         if device_summary is None:
-            device_summary = summarize_groups(
+            device_summary = _summarize_records_by_vibration(
                 data,
                 ("Treatment profile", "Device number", "Phase"),
             )
@@ -136,21 +204,26 @@ def _run_analysis_outputs(master_df, analysis, output_dir, device_summary=None):
     else:
         device_path = os.path.join(output_dir, "device_level_statistics.csv")
         if device_summary is None:
-            device_summary = summarize_groups(
-                data,
-                ("Treatment profile", "Device number", "Phase"),
+            device_summary = _summarize_records_by_vibration(
+                data, ("Treatment profile", "Device number", "Phase")
             )
             save_statistics(device_summary, device_path)
             outputs["csv_files"].append(device_path)
+            device_ranges_path = os.path.join(
+                output_dir, "device_level_ranges.csv"
+            )
+            save_ranges(device_summary, device_ranges_path)
+            outputs["csv_files"].append(device_ranges_path)
         elif not os.path.isfile(device_path):
             save_statistics(device_summary, device_path)
+            device_ranges_path = os.path.join(
+                output_dir, "device_level_ranges.csv"
+            )
+            save_ranges(device_summary, device_ranges_path)
+            outputs["csv_files"].extend([device_path, device_ranges_path])
 
-        device_results = pd.read_csv(
-            device_path,
-            dtype={"Device number": str},
-        )
         variability_outputs = _run_variability_analysis_outputs(
-            device_results, output_dir
+            device_summary, output_dir
         )
         outputs["csv_files"].extend(variability_outputs["csv_files"])
         outputs["plots"].extend(variability_outputs["plots"])
@@ -160,7 +233,7 @@ def _run_analysis_outputs(master_df, analysis, output_dir, device_summary=None):
 def _validate_analysis(master_df):
     if master_df.empty:
         raise ValueError("The master dataset is empty.")
-    _summary_rows(master_df)
+    _analysis_rows(master_df)
 
 
 def _write_shared_inputs(master_df, output_dir, file_report):
@@ -195,8 +268,8 @@ def run_all_analyses(master_df, output_dir, file_report=None):
     outputs["analyses"][PHASE_ANALYSIS] = _run_analysis_outputs(
         master_df, PHASE_ANALYSIS, output_dir
     )
-    device_summary = summarize_groups(
-        _summary_rows(master_df),
+    device_summary = _summarize_records_by_vibration(
+        _analysis_rows(master_df),
         ("Treatment profile", "Device number", "Phase"),
     )
     outputs["analyses"][DEVICE_ANALYSIS] = _run_analysis_outputs(
@@ -208,4 +281,5 @@ def run_all_analyses(master_df, output_dir, file_report=None):
     for analysis_outputs in outputs["analyses"].values():
         outputs["csv_files"].extend(analysis_outputs["csv_files"])
         outputs["plots"].extend(analysis_outputs["plots"])
+    outputs["comparator_config"] = generate_comparator_config(output_dir)
     return outputs

@@ -190,6 +190,32 @@ def _format_row(row):
     ]
 
 
+def _vibration_numbers(ranges):
+    numbers = []
+    next_phase = "phase 1"
+    vibration = 0
+    active_vibration = None
+
+    for phase in ranges:
+        label = (phase["label"] or "").strip().casefold()
+        if label == "phase 1":
+            vibration += 1
+            active_vibration = vibration
+            next_phase = "phase 2"
+        elif label == "phase 2" and next_phase == "phase 2":
+            next_phase = "phase 3"
+        elif label == "phase 3" and next_phase == "phase 3":
+            next_phase = None
+        else:
+            vibration += 1
+            active_vibration = vibration
+            next_phase = "phase 1"
+
+        numbers.append(active_vibration)
+
+    return numbers
+
+
 def write_range_export_csv(path, ranges, extrema, baseline, metadata):
     """Write summary and cycle-detail rows, returning the total cycle count."""
     metadata_values = {
@@ -209,19 +235,22 @@ def write_range_export_csv(path, ranges, extrema, baseline, metadata):
     with open(path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(RANGE_EXPORT_COLUMNS)
-        for vibration, phase in enumerate(ranges, start=1):
+        for phase, vibration in zip(ranges, _vibration_numbers(ranges)):
             cycles = _range_cycle_records(
                 extrema, phase["start_s"], phase["end_s"], baseline
             )
             total_cycles += len(cycles)
             vibration_name = f"Vibration {vibration}"
             phase_label = phase["label"] or "Unlabeled phase"
+            phase_start_s = phase["start_s"]
+            if phase_label.strip().casefold() == "phase 1" and cycles:
+                phase_start_s = cycles[0]["start_s"]
             summary = {
                 "Vibration": vibration_name,
                 "Phase": phase_label,
                 "Record Type": "Phase Summary",
                 "Cycle #": "Total cycles",
-                "Cycle Start (s)": f"START ({phase['start_s']:.3f})",
+                "Cycle Start (s)": f"START ({phase_start_s:.3f})",
                 "Cycle End (s)": f"END ({phase['end_s']:.3f})",
                 "Duration (s)": sum(cycle["duration_s"] for cycle in cycles),
                 "High Peak (mm)": _mean(cycles, "high_peak_mm"),

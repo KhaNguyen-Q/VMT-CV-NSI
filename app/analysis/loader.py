@@ -6,6 +6,7 @@ import os
 
 import pandas as pd
 
+from analysis.treatment_profiles import canonical_treatment_profile
 from windows.range_csv_export import RANGE_EXPORT_COLUMNS
 
 
@@ -18,6 +19,11 @@ NUMERIC_COLUMNS = (
     "Cycle Period (s)",
     "Frequency (Hz)",
     "Cycle Count",
+)
+CYCLE_DETAIL_NUMERIC_COLUMNS = (
+    *NUMERIC_COLUMNS,
+    "Cycle Start (s)",
+    "Cycle End (s)",
 )
 REQUIRED_COLUMNS = (
     "Vibration",
@@ -70,6 +76,9 @@ def load_range_csvs(paths):
                         column: (row.get(column) or "").strip()
                         for column in RANGE_EXPORT_COLUMNS
                     }
+                    normalized["Treatment profile"] = canonical_treatment_profile(
+                        normalized["Treatment profile"]
+                    )
                     if not all(
                         normalized[column]
                         for column in (

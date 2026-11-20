@@ -9,6 +9,7 @@ sample-videos/.
 sample-videos/
 
 test/
+tests/
 
 *.csv
 *.json
@@ -17,5 +18,5 @@ test/
 !mapping.example.json
 *plots
 *\docs\Improvements.md
-
+*\docs\Stanalysisplan.md
 changes-week8.md
