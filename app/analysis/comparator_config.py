@@ -19,13 +19,14 @@ _REQUIRED_COLUMNS = {
 }
 
 
-def generate_comparator_config(output_dir):
+def generate_comparator_config(output_dir, ranges_dir=None):
     """Create one editable comparator configuration grouped by profile."""
+    ranges_dir = ranges_dir or output_dir
     measurements_by_analysis = {}
     profiles = set()
 
     for analysis, filename in RANGE_FILES.items():
-        path = os.path.join(output_dir, filename)
+        path = os.path.join(ranges_dir, filename)
         with open(path, newline="", encoding="utf-8-sig") as handle:
             reader = csv.DictReader(handle)
             fieldnames = reader.fieldnames or []
@@ -64,7 +65,12 @@ def generate_comparator_config(output_dir):
             enabled_measurements[analysis] = measurements
 
         treatment_profiles[profile] = {
-            "baseline_ranges": dict(RANGE_FILES),
+            "baseline_ranges": {
+                analysis: os.path.relpath(
+                    os.path.join(ranges_dir, filename), output_dir
+                ).replace(os.sep, "/")
+                for analysis, filename in RANGE_FILES.items()
+            },
             "enabled_analyses": enabled_analyses,
             "enabled_measurements": enabled_measurements,
             "range_selection_method": "p5_p95",

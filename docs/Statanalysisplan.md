@@ -18,15 +18,19 @@ datasets are interpreted.
 
 Input
 
-    phase_population_ranges.csv
+    Rangesoutput/phase_population_ranges.csv
 
-    device_level_ranges.csv
+    Rangesoutput/device_level_ranges.csv
 
-    device_variability_ranges.csv
+    Rangesoutput/device_variability_ranges.csv
 
 Output
 
     comparator_config.json
+
+The analysis run also groups generated files into `Statisticsoutput`,
+`Rangesoutput`, `Input_files`, and `visualization`. The comparator config
+stores relative paths to the range files under `Rangesoutput`.
 
 Configuration Content
 

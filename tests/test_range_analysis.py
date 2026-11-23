@@ -138,13 +138,16 @@ class RangeAnalysisTests(unittest.TestCase):
             master, report = load_range_csvs([path])
             output = Path(temp_dir) / "analysis"
             run_all_analyses(master, output, report)
+            statistics_dir = output / "Statisticsoutput"
             output_rows = {}
             for name in (
                 "device_variability_statistics.csv",
                 "device_level_statistics.csv",
                 "phase_population_statistics.csv",
             ):
-                with (output / name).open(newline="", encoding="utf-8") as handle:
+                with (statistics_dir / name).open(
+                    newline="", encoding="utf-8"
+                ) as handle:
                     output_rows[name] = list(csv.DictReader(handle))
 
         for rows in output_rows.values():
@@ -291,11 +294,19 @@ class RangeAnalysisTests(unittest.TestCase):
             output = Path(temp_dir) / "cycle-statistics"
             run_all_analyses(master, output)
 
-            with (output / "phase_population_statistics.csv").open(
+            with (
+                output
+                / "Statisticsoutput"
+                / "phase_population_statistics.csv"
+            ).open(
                 newline="", encoding="utf-8"
             ) as handle:
                 phase_rows = list(csv.DictReader(handle))
-            with (output / "device_level_statistics.csv").open(
+            with (
+                output
+                / "Statisticsoutput"
+                / "device_level_statistics.csv"
+            ).open(
                 newline="", encoding="utf-8"
             ) as handle:
                 device_rows = list(csv.DictReader(handle))
@@ -406,19 +417,23 @@ class RangeAnalysisTests(unittest.TestCase):
             ) as handle:
                 comparator_config = json.load(handle)
 
-            with (output / "master_dataset.csv").open(
+            with (output / "Input_files" / "master_dataset.csv").open(
                 newline="", encoding="utf-8"
             ) as handle:
                 master_rows = list(csv.DictReader(handle))
-            with (output / "phase_population_statistics.csv").open(
+            with (
+                output
+                / "Statisticsoutput"
+                / "phase_population_statistics.csv"
+            ).open(
                 newline="", encoding="utf-8"
             ) as handle:
                 phase_rows = list(csv.DictReader(handle))
-            report_exists = (output / "input_files.csv").is_file()
+            report_exists = (output / "Input_files" / "input_files.csv").is_file()
             range_files_exist = (
-                (output / "phase_population_ranges.csv").is_file(),
-                (output / "device_level_ranges.csv").is_file(),
-                (output / "device_variability_ranges.csv").is_file(),
+                (output / "Rangesoutput" / "phase_population_ranges.csv").is_file(),
+                (output / "Rangesoutput" / "device_level_ranges.csv").is_file(),
+                (output / "Rangesoutput" / "device_variability_ranges.csv").is_file(),
             )
             mode_columns_exist = []
             for name in (
@@ -429,12 +444,19 @@ class RangeAnalysisTests(unittest.TestCase):
                 "device_variability_statistics.csv",
                 "device_variability_ranges.csv",
             ):
-                with (output / name).open(
+                output_folder = (
+                    "Rangesoutput" if name.endswith("_ranges.csv")
+                    else "Statisticsoutput"
+                )
+                with (output / output_folder / name).open(
                     newline="", encoding="utf-8"
                 ) as handle:
                     mode_columns_exist.append(
                         "mode" in csv.DictReader(handle).fieldnames
                     )
+            output_folders = {
+                path.name for path in output.iterdir() if path.is_dir()
+            }
 
         self.assertEqual(len(master_rows), 2)
         self.assertEqual(
@@ -460,7 +482,15 @@ class RangeAnalysisTests(unittest.TestCase):
         self.assertTrue(report_exists)
         self.assertTrue(all(range_files_exist))
         self.assertTrue(all(mode_columns_exist))
+        self.assertEqual(
+            output_folders,
+            {"Input_files", "Rangesoutput", "Statisticsoutput", "visualization"},
+        )
         profile_config = comparator_config["treatment_profiles"]["Profile A"]
+        self.assertEqual(
+            profile_config["baseline_ranges"]["phase_population"],
+            "Rangesoutput/phase_population_ranges.csv",
+        )
         self.assertEqual(profile_config["range_selection_method"], "p5_p95")
         self.assertEqual(profile_config["warning_thresholds"], None)
         self.assertEqual(profile_config["failure_thresholds"], None)
@@ -478,4 +508,12 @@ class RangeAnalysisTests(unittest.TestCase):
         for analysis, folder in expected_plot_folders.items():
             plot_paths = results["analyses"][analysis]["plots"]
             self.assertTrue(plot_paths)
-            self.assertTrue(all(Path(path).parent.name == folder for path in plot_paths))
+            self.assertTrue(
+                all(Path(path).parent.name == folder for path in plot_paths)
+            )
+            self.assertTrue(
+                all(
+                    Path(path).parent.parent.name == "visualization"
+                    for path in plot_paths
+                )
+            )

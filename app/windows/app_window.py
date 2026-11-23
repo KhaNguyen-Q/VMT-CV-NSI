@@ -6,11 +6,11 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QFileDialog,
     QComboBox,
-    QInputDialog,
     QHBoxLayout,
     QSplitter,
     QMessageBox,
     QSpinBox,
+    QVBoxLayout,
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QPixmap, QColor
@@ -53,6 +53,8 @@ project_root = get_project_root(os.path.dirname(os.path.abspath(__file__)))
 
 class AppWindow(QWidget):
     PLOT_UPDATE_EVERY = 10
+    DEFAULT_FRAME_WIDTH = 1920
+    DEFAULT_FRAME_HEIGHT = 1080
 
     def __init__(self):
         super().__init__()
@@ -74,13 +76,13 @@ class AppWindow(QWidget):
         self._estimate_done = False
         self.thread = None
         self._hsv_tip_slot = None
-        self.selected_display_option = "Image Contours"
+        self.selected_display_option = "Mask"
         self.selected_mask_option = "Tip Color (Red/Blue)"
-        self.selected_motion_axis = "x"
+        self.selected_motion_axis = "y"
         self.draw_params = True
         self.roi = None  # (x, y, w, h) or None
-        self._frame_width = 0
-        self._frame_height = 0
+        self._frame_width = self.DEFAULT_FRAME_WIDTH
+        self._frame_height = self.DEFAULT_FRAME_HEIGHT
         self._compare_window = None
 
         self.create_buttons()
@@ -104,15 +106,6 @@ class AppWindow(QWidget):
         self.select_file_button = QPushButton("Select Video", self)
         self.select_file_button.clicked.connect(self.select_video_file)
 
-        self.webcam_button = QPushButton("Webcam", self)
-        self.webcam_button.clicked.connect(self.webcam_selection)
-
-        self.draw_param_button = QPushButton("Hide Param", self)
-        self.draw_param_button.clicked.connect(self.draw_param_selection)
-
-        self.url_button = QPushButton("URL", self)
-        self.url_button.clicked.connect(self.url_submission)
-
         self.roi_button = QPushButton("Set ROI", self)
         self.roi_button.clicked.connect(self.select_roi)
         self.roi_button.setEnabled(False)
@@ -122,31 +115,27 @@ class AppWindow(QWidget):
 
         self.display_options = QComboBox(self)
         self.display_options.addItems(["Image Contours", "Main Video", "Mask"])
+        self.display_options.setCurrentText("Mask")
         self.display_options.currentTextChanged.connect(self.display_selection_changed)
-
-        self.mask_options = QComboBox(self)
-        self.mask_options.addItems(
-            ["Tip Color (Red/Blue)", "Edge Detection", "Circle Detection"]
-        )
-        self.mask_options.currentTextChanged.connect(self.mask_selection_changed)
 
         self.axis_options = QComboBox(self)
         self.axis_options.addItems(["Horizontal (x)", "Vertical (y)"])
+        self.axis_options.setCurrentText("Vertical (y)")
         self.axis_options.currentTextChanged.connect(self.axis_selection_changed)
 
         self.frame_width_spin = QSpinBox(self)
         self.frame_width_spin.setRange(0, 16000)
-        self.frame_width_spin.setValue(0)
+        self.frame_width_spin.setValue(self.DEFAULT_FRAME_WIDTH)
         self.frame_width_spin.setToolTip(
-            "Full-frame video width (px). Auto-filled from the file; "
-            "edit before Run — used for Tip L / position scale (detect → full)."
+            "Full-frame video width (px). Defaults to 1920; edit before Run "
+            "if needed — used for Tip L / position scale (detect → full)."
         )
         self.frame_height_spin = QSpinBox(self)
         self.frame_height_spin.setRange(0, 16000)
-        self.frame_height_spin.setValue(0)
+        self.frame_height_spin.setValue(self.DEFAULT_FRAME_HEIGHT)
         self.frame_height_spin.setToolTip(
-            "Full-frame video height (px). Auto-filled from the file; "
-            "edit before Run — used for Tip L / position scale (detect → full)."
+            "Full-frame video height (px). Defaults to 1080; edit before Run "
+            "if needed — used for Tip L / position scale (detect → full)."
         )
 
     def create_labels(self):
@@ -163,6 +152,7 @@ class AppWindow(QWidget):
             title="Position vs time",
             viewBox=GraphViewBox(),
         )
+        self.graph_view_box = self.plot.getViewBox()
         self.graph_layout.setToolTip(
             "Wheel: zoom both axes | Ctrl+wheel/right-drag: X axis | "
             "Shift+wheel/right-drag: Y axis | Left-drag: pan"
@@ -261,18 +251,14 @@ class AppWindow(QWidget):
         button_layout.addWidget(self.run_button)
         button_layout.addWidget(self.stop_button)
         button_layout.addWidget(self.select_file_button)
-        button_layout.addWidget(self.webcam_button)
-        button_layout.addWidget(self.url_button)
         button_layout.addWidget(self.roi_button)
         button_layout.addWidget(self.clear_roi_button)
         button_layout.addWidget(self.display_options)
-        button_layout.addWidget(self.mask_options)
         button_layout.addWidget(self.axis_options)
         button_layout.addWidget(QLabel("Frame W:"))
         button_layout.addWidget(self.frame_width_spin)
-        button_layout.addWidget(QLabel("H:"))
+        button_layout.addWidget(QLabel("Frame H:"))
         button_layout.addWidget(self.frame_height_spin)
-        button_layout.addWidget(self.draw_param_button)
         self.compare_button = QPushButton("Compare…", self)
         self.compare_button.setToolTip(
             "Open a separate window to overlay two exported tracking CSVs."
@@ -280,9 +266,39 @@ class AppWindow(QWidget):
         self.compare_button.clicked.connect(self.open_compare_window)
         button_layout.addWidget(self.compare_button)
 
+        graph_container = QWidget()
+        graph_container_layout = QVBoxLayout(graph_container)
+        graph_container_layout.setContentsMargins(0, 0, 0, 0)
+        graph_container_layout.addWidget(self.graph_layout)
+
+        graph_navigation_layout = QHBoxLayout()
+        graph_navigation_layout.setContentsMargins(0, 0, 0, 0)
+        self.graph_left_button = QPushButton("◀", self)
+        self.graph_right_button = QPushButton("▶", self)
+        self.graph_up_button = QPushButton("▲", self)
+        self.graph_down_button = QPushButton("▼", self)
+        for button in (
+            self.graph_left_button,
+            self.graph_right_button,
+            self.graph_up_button,
+            self.graph_down_button,
+        ):
+            button.setFixedSize(28, 24)
+        self.graph_left_button.clicked.connect(lambda: self.pan_graph("left"))
+        self.graph_right_button.clicked.connect(lambda: self.pan_graph("right"))
+        self.graph_up_button.clicked.connect(lambda: self.pan_graph("up"))
+        self.graph_down_button.clicked.connect(lambda: self.pan_graph("down"))
+        graph_navigation_layout.addStretch()
+        graph_navigation_layout.addWidget(self.graph_left_button)
+        graph_navigation_layout.addWidget(self.graph_up_button)
+        graph_navigation_layout.addWidget(self.graph_down_button)
+        graph_navigation_layout.addWidget(self.graph_right_button)
+        graph_navigation_layout.addStretch()
+        graph_container_layout.addLayout(graph_navigation_layout)
+
         video_graph_splitter = QSplitter(Qt.Horizontal)
         video_graph_splitter.addWidget(self.video_label)
-        video_graph_splitter.addWidget(self.graph_layout)
+        video_graph_splitter.addWidget(graph_container)
         video_graph_splitter.setSizes(
             [int(self.display_height * 0.4), int(self.display_height * 0.6)]
         )
@@ -312,53 +328,31 @@ class AppWindow(QWidget):
         self._compare_window.raise_()
         self._compare_window.activateWindow()
 
-    @pyqtSlot()
-    def url_submission(self):
-        dialog = QInputDialog()
-        dialog.setInputMode(QInputDialog.TextInput)
-        dialog.setWindowTitle("Submit video URL")
-        dialog.setLabelText("URL:")
-        dialog.setTextValue("")
-        dialog.resize(400, 200)
+    def pan_graph(self, direction):
+        x_range, y_range = self.graph_view_box.viewRange()
+        x_span = x_range[1] - x_range[0]
+        y_span = y_range[1] - y_range[0]
+        x_shift = x_span * 0.1
+        y_shift = y_span * 0.1
 
-        pressed = dialog.exec_()
+        if direction == "left":
+            x_range = (x_range[0] - x_shift, x_range[1] - x_shift)
+        elif direction == "right":
+            x_range = (x_range[0] + x_shift, x_range[1] + x_shift)
+        elif direction == "up":
+            y_range = (y_range[0] + y_shift, y_range[1] + y_shift)
+        elif direction == "down":
+            y_range = (y_range[0] - y_shift, y_range[1] - y_shift)
 
-        if pressed == QInputDialog.Accepted:
-            self.video_path = dialog.textValue()
-            self._probe_and_set_frame_size(self.video_path)
-            self.video_label.setText("Video Url Submitted\nSet Frame W/H if needed, then Run")
-            self.video_label.adjustSize()
-            self.run_button.setEnabled(True)
-            self.roi_button.setEnabled(True)
-
-    @pyqtSlot()
-    def webcam_selection(self):
-        self.video_path = 0
-        self._probe_and_set_frame_size(0)
-        self.video_label.setText("Webcam selected\nConfirm Frame W/H, then Run")
-        self.video_label.adjustSize()
-        self.run_button.setEnabled(True)
-        self.roi_button.setEnabled(True)
-
-    @pyqtSlot()
-    def draw_param_selection(self):
-        self.draw_params = not self.draw_params
-        self.draw_param_button.setText(
-            "Hide Param" if self.draw_params else "Draw Params"
+        self.graph_view_box.setRange(
+            xRange=x_range,
+            yRange=y_range,
+            padding=0,
         )
 
-    def _probe_and_set_frame_size(self, video_path):
-        """Read container frame size and fill Frame W/H (editable before Run)."""
-        cap = cv2.VideoCapture(video_path)
-        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-        if w < 8 or h < 8:
-            ret, frame = cap.read()
-            if ret and frame is not None:
-                h, w = frame.shape[:2]
-        cap.release()
-        self._frame_width = max(0, int(w))
-        self._frame_height = max(0, int(h))
+    def _set_default_frame_size(self):
+        self._frame_width = self.DEFAULT_FRAME_WIDTH
+        self._frame_height = self.DEFAULT_FRAME_HEIGHT
         self.frame_width_spin.setValue(self._frame_width)
         self.frame_height_spin.setValue(self._frame_height)
 
@@ -378,11 +372,11 @@ class AppWindow(QWidget):
 
         if file_name:
             self.video_path = file_name
-            self._probe_and_set_frame_size(file_name)
+            self._set_default_frame_size()
             self.video_label.setText(
                 f"{os.path.basename(file_name)} selected\n"
                 f"Frame {self.frame_width_spin.value()}×{self.frame_height_spin.value()} "
-                "(edit if wrong) → Set ROI (optional) → Run"
+                "(edit if needed) → Set ROI (optional) → Run"
             )
             self.video_label.adjustSize()
             self.run_button.setEnabled(True)
@@ -506,12 +500,8 @@ class AppWindow(QWidget):
     def update_button_states(self, running):
         self.run_button.setEnabled(not running and self.video_path is not None)
         self.select_file_button.setEnabled(not running)
-        self.webcam_button.setEnabled(not running)
         self.display_options.setEnabled(not running)
-        self.mask_options.setEnabled(not running)
         self.axis_options.setEnabled(not running)
-        self.url_button.setEnabled(not running)
-        self.draw_param_button.setEnabled(not running)
         self.roi_button.setEnabled(not running and self.video_path is not None)
         self.clear_roi_button.setEnabled(not running)
         self.frame_width_spin.setEnabled(not running)
@@ -555,7 +545,7 @@ class AppWindow(QWidget):
                     self,
                     "Frame size",
                     "Set Frame W and Frame H (full video resolution in pixels) "
-                    "before Run. Select a video to auto-fill, then edit if needed.",
+                    "before Run. Defaults are 1920×1080; edit if needed.",
                 )
                 return
 
@@ -619,9 +609,6 @@ class AppWindow(QWidget):
 
     def display_selection_changed(self, selected_option):
         self.selected_display_option = selected_option
-
-    def mask_selection_changed(self, selected_option):
-        self.selected_mask_option = selected_option
 
     def axis_selection_changed(self, selected_option):
         self.selected_motion_axis = "y" if "Vertical" in selected_option else "x"
