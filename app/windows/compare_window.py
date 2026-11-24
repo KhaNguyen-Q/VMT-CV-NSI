@@ -31,6 +31,7 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
+    QDialogButtonBox,
 )
 
 try:
@@ -40,7 +41,7 @@ try:
         load_treatment_profiles,
         save_treatment_profiles,
     )
-    from automation.phase_detector import detect_phase_ranges
+    from automation.phase_detector import detect_phase_ranges_with_auto_refinement
     from automation.signal_features import resample_extrema_signal
 except ModuleNotFoundError:
     from app.automation.detection_profiles import (
@@ -49,7 +50,7 @@ except ModuleNotFoundError:
         load_treatment_profiles,
         save_treatment_profiles,
     )
-    from app.automation.phase_detector import detect_phase_ranges
+    from app.automation.phase_detector import detect_phase_ranges_with_auto_refinement
     from app.automation.signal_features import resample_extrema_signal
 try:
     from windows.treatment_profile_dialog import TreatmentProfileDialog
@@ -1675,9 +1676,14 @@ class CompareWindow(QWidget):
             positions = self._baseline["px"]
             if self._baseline.get("extrema_only", False):
                 times, positions = resample_extrema_signal(times, positions)
-            result = detect_phase_ranges(
+            result = detect_phase_ranges_with_auto_refinement(
                 times,
                 positions,
+                extrema=(
+                    self._baseline_extrema["rows"]
+                    if self._baseline_extrema is not None
+                    else None
+                ),
                 profile=selected_profile,
                 profiles=self._treatment_profiles,
                 method=self.detection_method_combo.currentText(),
@@ -1688,22 +1694,11 @@ class CompareWindow(QWidget):
         self._last_detection_result = result
         self.detection_diagnostics_btn.setEnabled(True)
         if not result.phase_ranges:
-            noise = result.noise_profile
-            rejection_summary = self._format_detection_rejections(
-                result.diagnostics
-            )
             QMessageBox.information(
                 self,
                 "Auto Detect Phases",
-                "No complete vibration events with Phase 1, Phase 2, and Phase 3 "
-                "were detected. Existing phase ranges were kept.\n\n"
-                f"Detection method: {result.profile_metadata['detection_method']}.\n"
-                f"Profile: {result.profile_metadata['selected_profile']} "
-                f"(resolved as {result.profile_metadata['resolved_profile']}).\n"
-                f"Analyzed {result.cycle_count} cycles. Noise floor: RMS "
-                f"{noise['rms']:.4g}, peak-to-peak {noise['peak_to_peak']:.4g}, "
-                f"average frequency {noise['average_frequency_hz']:.3g} Hz."
-                f"{rejection_summary}",
+                f"Detected {len(result.events)} vibration events."
+                f"{self._format_auto_refinement_summary(result.profile_metadata)}",
             )
             return
 
@@ -1711,45 +1706,46 @@ class CompareWindow(QWidget):
         self._detection_metadata = result.profile_metadata
         self._refresh_phase_table()
         self._align_and_redraw(estimate_offset=False)
-        noise = result.noise_profile
-        event_details = "; ".join(
-            f"Event {event['event']}: start {event['vibration_start_s']:.3f}s, "
-            f"Phase 2 {event['phase2_start_s']:.3f}s, "
-            f"Phase 3 {event['phase3_start_s']:.3f}s, "
-            f"validation {event['validation_confidence']:.2f}"
-            for event in result.events
-        )
         QMessageBox.information(
             self,
             "Auto Detect Phases",
-            f"Detected {len(result.events)} complete vibration event(s) "
-            f"({len(result.phase_ranges)} phase ranges). The existing phase ranges "
-            "were replaced.\n\n"
-            f"Detection method: {result.profile_metadata['detection_method']}.\n"
-            f"Profile: {result.profile_metadata['selected_profile']} "
-            f"(resolved as {result.profile_metadata['resolved_profile']}); "
-            f"confidence {result.profile_metadata['detection_confidence']:.2f}.\n"
-            f"Noise floor: RMS {noise['rms']:.4g}, peak-to-peak "
-            f"{noise['peak_to_peak']:.4g}, average frequency "
-            f"{noise['average_frequency_hz']:.3g} Hz.\n"
-            f"{event_details}",
+            f"Detected {len(result.events)} vibration events."
+            f"{self._format_auto_refinement_summary(result.profile_metadata)}",
         )
 
     @staticmethod
-    def _format_detection_rejections(diagnostics):
-        counts = {}
-        for diagnostic in diagnostics:
-            for reason in diagnostic["rejection_reasons"]:
-                counts[reason] = counts.get(reason, 0) + 1
-        if not counts:
-            return "\nNo qualifying vibration candidates were found."
-        details = "; ".join(
-            f"{reason}: {count}"
-            for reason, count in sorted(
-                counts.items(), key=lambda item: (-item[1], item[0])
+    def _format_auto_refinement_summary(metadata):
+        refinement = metadata.get("auto_refinement")
+        if refinement is None:
+            return ""
+        status = refinement["status"]
+        if status == "tagged_extrema_unavailable":
+            return (
+                "\nTagged-cycle refinement was not run because baseline "
+                "tagged extrema are unavailable."
             )
+        if status == "no_phase1_ranges":
+            return (
+                "\nTagged-cycle refinement was not run because no Phase 1 "
+                "ranges were detected."
+            )
+        counts = ", ".join(
+            str(count) for count in refinement["tagged_phase1_counts"]
         )
-        return f"\nCandidate rejection summary: {details}."
+        exact = refinement["exact_11_count"]
+        total = refinement["phase1_count"]
+        attempts = refinement["attempted_candidates"]
+        if refinement["all_phase1_have_11"]:
+            outcome = f"all {total} Phase 1 range(s) have exactly 11 tagged cycles"
+        else:
+            outcome = (
+                f"{exact}/{total} Phase 1 range(s) have exactly 11 tagged cycles "
+                f"(counts: {counts})"
+            )
+        return (
+            f"\nAuto refinement: {outcome}; evaluated {attempts} alternative "
+            f"profile(s)."
+        )
 
     def _show_detection_diagnostics(self):
         if self._last_detection_result is None:

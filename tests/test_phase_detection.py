@@ -2,10 +2,15 @@ import csv
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
-from app.automation.phase_detector import detect_phase_ranges
+from app.automation.phase_detector import (
+    PhaseDetectionResult,
+    detect_phase_ranges,
+    detect_phase_ranges_with_auto_refinement,
+)
 from app.automation.detection_profiles import (
     TreatmentProfile,
     default_treatment_profiles,
@@ -63,6 +68,115 @@ def _add_vibration(positions, times, start_s):
 
 
 class PhaseDetectionTests(unittest.TestCase):
+    def test_auto_refinement_selects_candidate_with_eleven_tagged_cycles(self):
+        profiles = default_treatment_profiles()
+        auto_profile = next(
+            profile for profile in profiles if profile.name == "Auto Detect"
+        )
+        extrema = [
+            {"time_s": float(index), "label": label}
+            for index in range(1, 12)
+            for label in ("top", "bottom")
+        ]
+
+        def fake_detect(
+            times,
+            positions,
+            config=None,
+            profile=None,
+            profiles=None,
+            method="FSM",
+        ):
+            resolved = next(
+                item
+                for item in profiles
+                if item.expected_amplitude_category == "0.4 mm"
+            )
+            target_met = abs(resolved.frequency_increase_ratio - 1.125) < 1e-9
+            return PhaseDetectionResult(
+                phase_ranges=[
+                    {
+                        "label": "Phase 1",
+                        "start_s": 0.0,
+                        "end_s": 11.5 if target_met else 10.5,
+                    }
+                ],
+                events=[{"event": 1}],
+                candidate_regions=[],
+                noise_profile={},
+                cycle_count=0,
+                diagnostics=[],
+                profile_metadata={
+                    "selected_profile": "Auto Detect",
+                    "resolved_profile": resolved.name,
+                    "expected_amplitude_category": "0.4 mm",
+                    "parameters_used": {},
+                    "detection_confidence": 0.8,
+                },
+            )
+
+        with patch(
+            "app.automation.phase_detector.detect_phase_ranges",
+            side_effect=fake_detect,
+        ) as detector:
+            result = detect_phase_ranges_with_auto_refinement(
+                np.asarray([0.0, 1.0]),
+                np.asarray([0.0, 1.0]),
+                extrema,
+                profile=auto_profile,
+                profiles=profiles,
+            )
+
+        self.assertEqual(detector.call_count, 2)
+        self.assertEqual(
+            result.profile_metadata["auto_refinement"]["tagged_phase1_counts"],
+            [11],
+        )
+        self.assertTrue(
+            result.profile_metadata["auto_refinement"]["all_phase1_have_11"]
+        )
+        self.assertEqual(
+            result.profile_metadata["auto_refinement"]["status"], "target_met"
+        )
+
+    def test_auto_refinement_improves_tagged_cycle_score_on_sample(self):
+        project_root = Path(__file__).resolve().parents[1]
+        recording_path = project_root / "data" / "csv" / "Baseline1.1.csv"
+        with recording_path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        times = np.asarray([float(row["time_s"]) for row in rows])
+        positions = np.asarray([float(row["y_px"]) for row in rows])
+        extrema = find_peak_to_peak_extrema(times, positions)
+        profiles = default_treatment_profiles()
+        auto_profile = next(
+            profile for profile in profiles if profile.name == "Auto Detect"
+        )
+
+        initial = detect_phase_ranges(
+            times,
+            positions,
+            profile=auto_profile,
+            profiles=profiles,
+        )
+        initial_counts = [
+            tagged_cycle_count(extrema, phase["start_s"], phase["end_s"])
+            for phase in initial.phase_ranges
+            if phase["label"] == "Phase 1"
+        ]
+        result = detect_phase_ranges_with_auto_refinement(
+            times,
+            positions,
+            extrema,
+            profile=auto_profile,
+            profiles=profiles,
+        )
+
+        self.assertEqual(len(result.events), len(initial.events))
+        self.assertGreater(
+            result.profile_metadata["auto_refinement"]["exact_11_count"],
+            sum(count == 11 for count in initial_counts),
+        )
+
     def test_auto_profile_detects_low_and_high_amplitude_baseline_files(self):
         project_root = Path(__file__).resolve().parents[1]
         expected = {

@@ -5,6 +5,11 @@ import os
 
 import numpy as np
 
+try:
+    from automation.tagged_cycles import tagged_cycle_count
+except ModuleNotFoundError:
+    from app.automation.tagged_cycles import tagged_cycle_count
+
 
 _PX_TO_MM = 0.1
 
@@ -62,19 +67,6 @@ def ranges_for_phase(ranges, selected_phase):
         if (phase["label"] or "Unlabeled phase").strip().casefold()
         == selected_phase.casefold()
     ]
-
-
-def tagged_cycle_count(extrema, start_s, end_s):
-    """Match the comparison table's count of paired top/bottom extrema."""
-    in_range = [
-        row
-        for row in extrema
-        if start_s <= row["time_s"] <= end_s
-        and row["label"] in ("top", "bottom")
-    ]
-    top_count = sum(row["label"] == "top" for row in in_range)
-    bottom_count = sum(row["label"] == "bottom" for row in in_range)
-    return min(top_count, bottom_count)
 
 
 def _baseline_position_mm(series, time_s):

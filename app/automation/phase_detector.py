@@ -26,8 +26,11 @@ from .signal_features import (
     find_quiet_intervals,
     prepare_signal,
 )
+from .tagged_cycles import tagged_cycle_count
 
 _logger = logging.getLogger(__name__)
+_AUTO_REFINEMENT_MAX_ATTEMPTS = 24
+_TARGET_PHASE1_TAGGED_CYCLES = 11
 
 
 @dataclass(frozen=True)
@@ -399,3 +402,294 @@ def detect_phase_ranges(
         diagnostics=candidate_diagnostics,
         profile_metadata=profile_metadata,
     )
+
+
+def detect_phase_ranges_with_auto_refinement(
+    times,
+    positions,
+    extrema,
+    config=None,
+    profile=None,
+    profiles=None,
+    method="FSM",
+):
+    """Refine Auto Detect boundaries against the tagged Phase 1 cycle count."""
+    profiles = list(profiles or default_treatment_profiles())
+    selected_profile_name = (
+        "Auto Detect"
+        if profile is None
+        else profile
+        if isinstance(profile, str)
+        else profile.name
+    )
+    initial = detect_phase_ranges(
+        times,
+        positions,
+        config=config,
+        profile=profile,
+        profiles=profiles,
+        method=method,
+    )
+    if selected_profile_name != "Auto Detect":
+        return initial
+
+    if not initial.phase_ranges:
+        return _with_refinement_metadata(
+            initial,
+            {
+                "status": "no_phase1_ranges",
+                "attempted_candidates": 0,
+                "tagged_phase1_counts": [],
+                "exact_11_count": 0,
+                "phase1_count": 0,
+                "all_phase1_have_11": False,
+            },
+        )
+    if extrema is None or len(extrema) == 0:
+        return _with_refinement_metadata(
+            initial,
+            {
+                "status": "tagged_extrema_unavailable",
+                "attempted_candidates": 0,
+                "tagged_phase1_counts": [],
+                "exact_11_count": 0,
+                "phase1_count": 0,
+                "all_phase1_have_11": False,
+            },
+        )
+
+    baseline_counts = _phase1_tagged_counts(initial, extrema)
+    if not baseline_counts:
+        return _with_refinement_metadata(
+            initial,
+            _refinement_summary([], 0, "no_phase1_ranges"),
+        )
+    baseline_profile = _resolved_profile(initial, profiles)
+    best = initial
+    best_counts = baseline_counts
+    best_profile = baseline_profile
+    best_score = _refinement_score(initial, baseline_counts, baseline_profile)
+    attempts = 0
+    if all(count == _TARGET_PHASE1_TAGGED_CYCLES for count in baseline_counts):
+        return _with_refinement_metadata(
+            initial,
+            _refinement_summary(baseline_counts, attempts, "target_met"),
+        )
+
+    for overrides in _auto_refinement_candidates(baseline_profile):
+        candidate_profile = replace(baseline_profile, **overrides)
+        candidate_profile.validate()
+        candidate_profiles = [
+            candidate_profile if item.name == baseline_profile.name else item
+            for item in profiles
+        ]
+        if not any(item.name == baseline_profile.name for item in profiles):
+            candidate_profiles.append(candidate_profile)
+
+        candidate = detect_phase_ranges(
+            times,
+            positions,
+            config=config,
+            profile=profile,
+            profiles=candidate_profiles,
+            method=method,
+        )
+        attempts += 1
+        candidate_counts = _phase1_tagged_counts(candidate, extrema)
+        if (
+            len(candidate.events) != len(initial.events)
+            or len(candidate_counts) != len(baseline_counts)
+        ):
+            continue
+
+        candidate_score = _refinement_score(
+            candidate,
+            candidate_counts,
+            candidate_profile,
+            reference_profile=baseline_profile,
+        )
+        if candidate_score > best_score:
+            best = candidate
+            best_counts = candidate_counts
+            best_profile = candidate_profile
+            best_score = candidate_score
+        if all(
+            count == _TARGET_PHASE1_TAGGED_CYCLES
+            for count in candidate_counts
+        ):
+            best = candidate
+            best_counts = candidate_counts
+            best_profile = candidate_profile
+            break
+
+    status = (
+        "target_met"
+        if all(
+            count == _TARGET_PHASE1_TAGGED_CYCLES for count in best_counts
+        )
+        else "improved"
+        if best is not initial
+        else "best_effort"
+    )
+    refinement = _refinement_summary(best_counts, attempts, status)
+    refinement["parameters_used"] = {
+        "min_cycles": best_profile.min_cycles,
+        "periodicity_threshold": best_profile.periodicity_threshold,
+        "frequency_increase_ratio": best_profile.frequency_increase_ratio,
+        "sustained_frequency_cycles": best_profile.sustained_frequency_cycles,
+    }
+    return _with_refinement_metadata(best, refinement)
+
+
+def _phase1_tagged_counts(result, extrema):
+    return [
+        tagged_cycle_count(extrema, phase["start_s"], phase["end_s"])
+        for phase in result.phase_ranges
+        if phase["label"].casefold() == "phase 1"
+    ]
+
+
+def _resolved_profile(result, profiles):
+    resolved_name = result.profile_metadata["resolved_profile"]
+    profile = next(
+        (item for item in profiles if item.name == resolved_name),
+        None,
+    )
+    if profile is not None:
+        return profile
+    return next(
+        item
+        for item in default_treatment_profiles()
+        if item.name == resolved_name
+    )
+
+
+def _auto_refinement_candidates(profile):
+    candidates = []
+    seen = set()
+    adjustments = [
+        {"frequency_increase_ratio": profile.frequency_increase_ratio + delta}
+        for delta in (-0.025, 0.025, -0.05, 0.05)
+    ]
+    adjustments.extend(
+        {"sustained_frequency_cycles": profile.sustained_frequency_cycles + delta}
+        for delta in (-1, 1, -2, 2)
+    )
+    adjustments.extend(
+        {
+            "frequency_increase_ratio": profile.frequency_increase_ratio + ratio_delta,
+            "sustained_frequency_cycles": (
+                profile.sustained_frequency_cycles + cycle_delta
+            ),
+        }
+        for ratio_delta in (-0.05, 0.05)
+        for cycle_delta in (-1, 1)
+    )
+    adjustments.extend(
+        {"min_cycles": profile.min_cycles + delta}
+        for delta in (-2, -1, 1, 2)
+    )
+    adjustments.extend(
+        {"periodicity_threshold": profile.periodicity_threshold + delta}
+        for delta in (-0.1, 0.1, -0.2, 0.2)
+    )
+    adjustments.extend(
+        {
+            "min_cycles": profile.min_cycles + cycle_delta,
+            "periodicity_threshold": profile.periodicity_threshold + threshold_delta,
+        }
+        for cycle_delta in (-1, 1)
+        for threshold_delta in (-0.1, 0.1)
+    )
+    for candidate in adjustments[:_AUTO_REFINEMENT_MAX_ATTEMPTS]:
+        values = (
+            candidate.get(
+                "frequency_increase_ratio", profile.frequency_increase_ratio
+            ),
+            candidate.get(
+                "sustained_frequency_cycles",
+                profile.sustained_frequency_cycles,
+            ),
+            candidate.get("min_cycles", profile.min_cycles),
+            candidate.get(
+                "periodicity_threshold", profile.periodicity_threshold
+            ),
+        )
+        if values in seen or values == (
+            profile.frequency_increase_ratio,
+            profile.sustained_frequency_cycles,
+            profile.min_cycles,
+            profile.periodicity_threshold,
+        ):
+            continue
+        seen.add(values)
+        if (
+            values[0] <= 1
+            or values[1] < 1
+            or values[2] < 2
+            or not 0 <= values[3] <= 1
+        ):
+            continue
+        candidates.append(candidate)
+    return candidates
+
+
+def _refinement_score(result, counts, profile, reference_profile=None):
+    exact_count = sum(count == _TARGET_PHASE1_TAGGED_CYCLES for count in counts)
+    total_distance = sum(
+        abs(count - _TARGET_PHASE1_TAGGED_CYCLES) for count in counts
+    )
+    confidence = result.profile_metadata.get("detection_confidence") or 0.0
+    reference_profile = reference_profile or profile
+    parameter_changes = sum(
+        (
+            profile.frequency_increase_ratio
+            != reference_profile.frequency_increase_ratio,
+            profile.sustained_frequency_cycles
+            != reference_profile.sustained_frequency_cycles,
+            profile.min_cycles != reference_profile.min_cycles,
+            profile.periodicity_threshold
+            != reference_profile.periodicity_threshold,
+        )
+    )
+    parameter_distance = (
+        abs(
+            profile.frequency_increase_ratio
+            - reference_profile.frequency_increase_ratio
+        )
+        + abs(
+            profile.sustained_frequency_cycles
+            - reference_profile.sustained_frequency_cycles
+        )
+        + abs(profile.min_cycles - reference_profile.min_cycles)
+        + abs(
+            profile.periodicity_threshold
+            - reference_profile.periodicity_threshold
+        )
+    )
+    return (
+        exact_count,
+        -total_distance,
+        confidence,
+        -parameter_changes,
+        -parameter_distance,
+    )
+
+
+def _refinement_summary(counts, attempts, status):
+    exact_count = sum(count == _TARGET_PHASE1_TAGGED_CYCLES for count in counts)
+    return {
+        "status": status,
+        "attempted_candidates": attempts,
+        "tagged_phase1_counts": list(counts),
+        "exact_11_count": exact_count,
+        "phase1_count": len(counts),
+        "all_phase1_have_11": bool(counts)
+        and exact_count == len(counts),
+    }
+
+
+def _with_refinement_metadata(result, refinement):
+    metadata = dict(result.profile_metadata)
+    metadata["auto_refinement"] = refinement
+    return replace(result, profile_metadata=metadata)
