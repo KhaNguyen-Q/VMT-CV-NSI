@@ -4,6 +4,11 @@ import csv
 import json
 import os
 
+try:
+    from analysis.treatment_profiles import canonical_treatment_profile
+except ModuleNotFoundError:
+    from app.analysis.treatment_profiles import canonical_treatment_profile
+
 
 RANGE_FILES = {
     "phase_population": "phase_population_ranges.csv",
@@ -17,6 +22,50 @@ _REQUIRED_COLUMNS = {
     "range_p05_lower",
     "range_p95_upper",
 }
+
+
+def load_comparator_config(config_path):
+    """Load and validate a comparator configuration."""
+    config_path = os.path.abspath(os.fspath(config_path))
+    with open(config_path, "r", encoding="utf-8") as handle:
+        config = json.load(handle)
+
+    if config.get("schema_version") != 1:
+        raise ValueError("Unsupported comparator configuration schema.")
+    profiles = config.get("treatment_profiles")
+    if not isinstance(profiles, dict) or not profiles:
+        raise ValueError("Comparator configuration has no treatment profiles.")
+
+    return {
+        "path": config_path,
+        "directory": os.path.dirname(config_path),
+        "config": config,
+        "treatment_profiles": profiles,
+    }
+
+
+def get_profile_config(config_path, treatment_profile):
+    """Resolve one canonical treatment profile from a comparator configuration."""
+    loaded = load_comparator_config(config_path)
+    canonical_profile = canonical_treatment_profile(treatment_profile)
+    profiles = loaded["treatment_profiles"]
+    if canonical_profile in profiles:
+        profile_config = profiles[canonical_profile]
+    else:
+        profile_config = next(
+            (
+                value
+                for profile, value in profiles.items()
+                if canonical_treatment_profile(profile) == canonical_profile
+            ),
+            None,
+        )
+    if profile_config is None:
+        raise ValueError(
+            f'Treatment profile "{treatment_profile}" is not available '
+            "in the selected comparator configuration."
+        )
+    return loaded, profile_config
 
 
 def generate_comparator_config(output_dir, ranges_dir=None):

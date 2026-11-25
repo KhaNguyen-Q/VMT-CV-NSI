@@ -24,10 +24,11 @@ _OTHER_PROFILE = "__other__"
 
 
 class ReportMetadataDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, treatment_profile=None):
         super().__init__(parent)
         self.setWindowTitle("Report details")
         self._inputs = {}
+        self._fixed_treatment_profile = treatment_profile
 
         form = QFormLayout()
         for label in _METADATA_FIELDS:
@@ -48,9 +49,23 @@ class ReportMetadataDialog(QDialog):
         self._custom_treatment_profile.setPlaceholderText(
             "Enter a treatment profile"
         )
-        form.addRow("Treatment profile", self._treatment_profile)
-        form.addRow(self._custom_profile_label, self._custom_treatment_profile)
+        if treatment_profile is None:
+            form.addRow("Treatment profile", self._treatment_profile)
+            form.addRow(self._custom_profile_label, self._custom_treatment_profile)
+        else:
+            selected_index = self._treatment_profile.findData(treatment_profile)
+            if selected_index < 0:
+                self._treatment_profile.setCurrentIndex(
+                    self._treatment_profile.count() - 1
+                )
+                self._custom_treatment_profile.setText(treatment_profile)
+            else:
+                self._treatment_profile.setCurrentIndex(selected_index)
         self._update_custom_profile_visibility()
+        if treatment_profile is not None:
+            self._treatment_profile.hide()
+            self._custom_profile_label.hide()
+            self._custom_treatment_profile.hide()
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel,
@@ -74,10 +89,13 @@ class ReportMetadataDialog(QDialog):
             label: self._inputs[label].text().strip()
             for label in _METADATA_FIELDS
         }
-        selected_profile = self._treatment_profile.currentData()
-        metadata["Treatment profile"] = (
-            self._custom_treatment_profile.text().strip()
-            if selected_profile == _OTHER_PROFILE
-            else selected_profile or ""
-        )
+        if self._fixed_treatment_profile is not None:
+            metadata["Treatment profile"] = self._fixed_treatment_profile
+        else:
+            selected_profile = self._treatment_profile.currentData()
+            metadata["Treatment profile"] = (
+                self._custom_treatment_profile.text().strip()
+                if selected_profile == _OTHER_PROFILE
+                else selected_profile or ""
+            )
         return metadata

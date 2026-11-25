@@ -6,8 +6,12 @@ import os
 
 import pandas as pd
 
-from analysis.treatment_profiles import canonical_treatment_profile
-from windows.range_csv_export import RANGE_EXPORT_COLUMNS
+try:
+    from analysis.treatment_profiles import canonical_treatment_profile
+    from windows.range_csv_export import RANGE_EXPORT_COLUMNS
+except ModuleNotFoundError:
+    from app.analysis.treatment_profiles import canonical_treatment_profile
+    from app.windows.range_csv_export import RANGE_EXPORT_COLUMNS
 
 
 NUMERIC_COLUMNS = (

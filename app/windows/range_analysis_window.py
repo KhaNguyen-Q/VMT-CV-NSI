@@ -3,6 +3,7 @@
 import os
 
 from PyQt5.QtWidgets import (
+    QCheckBox,
     QFileDialog,
     QHBoxLayout,
     QComboBox,
@@ -16,9 +17,16 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt
 
-from analysis.loader import load_range_csvs
-from analysis.runner import run_all_analyses
-from analysis.treatment_profiles import TREATMENT_PROFILES
+try:
+    from analysis.loader import load_range_csvs
+    from analysis.runner import run_all_analyses
+    from analysis.treatment_profiles import TREATMENT_PROFILES
+    from analysis.baseline_registry import register_baseline
+except ModuleNotFoundError:
+    from app.analysis.loader import load_range_csvs
+    from app.analysis.runner import run_all_analyses
+    from app.analysis.treatment_profiles import TREATMENT_PROFILES
+    from app.analysis.baseline_registry import register_baseline
 
 
 class RangeAnalysisWindow(QWidget):
@@ -64,12 +72,24 @@ class RangeAnalysisWindow(QWidget):
         treatment_profile_controls.addWidget(QLabel("Treatment profile:", self))
         treatment_profile_controls.addWidget(self.treatment_profile_combo)
 
+        baseline_controls = QHBoxLayout()
+        self.register_baseline_check = QCheckBox(
+            "Register this run as an available baseline", self
+        )
+        self.register_baseline_check.setChecked(True)
+        baseline_controls.addWidget(self.register_baseline_check)
+        self.set_default_baseline_check = QCheckBox(
+            "Set as default baseline for this profile", self
+        )
+        baseline_controls.addWidget(self.set_default_baseline_check)
+
         output_name_controls = QHBoxLayout()
         output_name_controls.addWidget(QLabel("Analysis folder name:", self))
         output_name_controls.addWidget(self.output_name_input)
 
         layout = QVBoxLayout(self)
         layout.addLayout(treatment_profile_controls)
+        layout.addLayout(baseline_controls)
         layout.addWidget(QLabel("Input CSV files:", self))
         layout.addLayout(input_controls)
         layout.addWidget(self.file_list)
@@ -178,6 +198,33 @@ class RangeAnalysisWindow(QWidget):
             QMessageBox.warning(self, "Analysis failed", str(exc))
             self.status_label.setText("Analysis failed.")
             return
+
+        if self.register_baseline_check.isChecked():
+            profile_present = (
+                "Treatment profile" in master_df.columns
+                and (master_df["Treatment profile"].astype(str).str.strip() == treatment_profile).any()
+            )
+            if not profile_present:
+                QMessageBox.warning(
+                    self,
+                    "Baseline not registered",
+                    f'The analyzed data does not contain treatment profile '
+                    f'"{treatment_profile}", so it was not registered as a baseline.',
+                )
+            else:
+                try:
+                    register_baseline(
+                        treatment_profile,
+                        outputs["comparator_config"],
+                        run_name=folder_name,
+                        set_default=self.set_default_baseline_check.isChecked(),
+                    )
+                except (OSError, ValueError, KeyError) as exc:
+                    QMessageBox.warning(
+                        self,
+                        "Baseline registration failed",
+                        str(exc),
+                    )
 
         loaded_files = int(
             (file_report["Summary rows loaded"] > 0).sum()

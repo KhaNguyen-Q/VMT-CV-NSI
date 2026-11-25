@@ -21,4 +21,7 @@ tests/
 *\docs\Stanalysisplan.md
 changes-week8.md
 
-*docs 
+*docs
+!docs/
+docs/*
+!docs/Statanalysisdoc.md

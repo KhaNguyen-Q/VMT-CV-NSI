@@ -1,76 +1,51 @@
---------------------------------------------------
-COMPARATOR CONFIGURATION GENERATION
---------------------------------------------------
+The existing Export Report Table workflow is isolated from the statistical analysis pipeline and should be integrated with a aggregated baseline system. 
 
-Purpose
+Rather than comparing a single Baseline.csv against a single Comparison.csv, the report-generation process should use the "outputRanges"/"comparator_config.json". The reason why it's either or is because I have not thought of the true implementation yet so we will brain storm which is the true comparator "acceptable range" 
 
-Generate a centralized comparison configuration from
-the baseline range datasets.
+ 
 
-The configuration file does not replace the baseline
-range datasets.
+This is how it behaves currently: 
 
-The baseline range datasets remain the authoritative
-reference data used during comparison.
+Takes the two loaded CSV files in compare_window.py (Baseline.csv, Comparison.csv)  
 
-The configuration file defines how those baseline
-datasets are interpreted.
+Click the "Export report table..." 
 
-Input
+Runs the script that "exports a comparison table report" using the two CSV files 
 
-    Rangesoutput/phase_population_ranges.csv
+Comparison is completed with just those 2 files. 
 
-    Rangesoutput/device_level_ranges.csv
+Outputs a .docx file which can be edited 
 
-    Rangesoutput/device_variability_ranges.csv
+Recommended changes: 
 
-Output
+Rewire the script that "exports a comparison table report" to use the "Analyze exported range CSVs..." Flow to create a mass aggregated "Baseline" so the loaded comparison.csv are compared to a dynamic "Baseline" that includes multiple samples. 
 
-    comparator_config.json
+ 
 
-The analysis run also groups generated files into `Statisticsoutput`,
-`Rangesoutput`, `Input_files`, and `visualization`. The comparator config
-stores relative paths to the range files under `Rangesoutput`.
+The intended new behaviour should: 
 
-Configuration Content
+After the user Completes "Run all Analysis" in the "Range Statistical analysis window". The "outputRanges" files and or the "comparator_config.json" should be stored somewhere that they can be referenced by the new comparison script (The user can select them) 
 
-    • Enabled analyses
-    • Enabled measurements
-    • Range selection method
-    • Warning thresholds
-    • Failure thresholds
-    • Scoring rules
-    • Analysis weighting
+Takes the loaded Comparison.csv (making sure it labeled as 1 of the 3 treatment profiles) 
 
-Generation Defaults
+Select some sort of "which treatment profile is this", the result points to the appropriate stored "outputRanges" files and or the "comparator_config.json" 
 
-    • Write one comparator_config.json containing a separate
-      treatment_profiles entry for each profile found in the
-      three range datasets.
-    • Enable analyses and measurements present in that profile's
-      range data.
-    • Set range_selection_method to "p5_p95".
-    • Leave warning thresholds, failure thresholds, scoring
-      rules, and analysis weighting unset (null) for editing.
-    • Include the range dataset filenames for each analysis.
+Runs a script that acts as "exports a comparison table" (The name of the button can be changed) using the Comparison.csv and (outputRanges/comparator_config.json) 
 
---------------------------------------------------
-FUTURE COMPARISON WORKFLOW
---------------------------------------------------
+Outputs the .docx file which can be edited 
 
-Future comparison workflows shall:
+ 
 
-    1. Load a processed CSV.
-    2. Identify the treatment profile.
-    3. Load comparator_config.json.
-    4. Load the corresponding baseline range datasets.
-    5. Compare measurements against the configured
-       statistical boundaries.
-    6. Generate comparison results and summary metrics.
+The only changes are the prerequisite steps before the "export table report". When "export table report" is clicked, it should check if there is a comparison.csv loaded and prompt the user. 
 
-The baseline generation stage produces statistical
-reference datasets only.
+Treatment profile options 
 
-Comparison scoring, warning classification, pass/fail
-evaluation, and reporting are performed by separate
-comparison workflows.
+Depending on what Treatment profile is selected it will try to find the referenced "outputRanges.csv"/"comparator_config.json" 
+
+The user can change the referenced "outputRanges.csv"/"comparator_config.json" but first it is defaulted 
+
+Then generate the .docx 
+
+ 
+
+The compare_window/py essentially becomes a .csv processor component and the actual comparison is completed with the "Export report table" logic
