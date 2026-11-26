@@ -210,6 +210,35 @@ class PhaseDetectionTests(unittest.TestCase):
                 self.assertIn("signal_to_noise_ratio", result.diagnostics[0])
                 self.assertIn("rejection_reasons", result.diagnostics[0])
 
+    def test_auto_detect_ignores_weak_prelude_before_first_vibration(self):
+        times = np.arange(0.0, 11.0, 0.01)
+        rng = np.random.default_rng(42)
+        positions = rng.normal(0.0, 0.002, times.size)
+        prelude = (times >= 0.1) & (times < 3.5)
+        positions[prelude] += 0.015 * np.sin(
+            2.0 * np.pi * 2.0 * (times[prelude] - 0.1)
+        )
+        _add_vibration(positions, times, 3.5)
+        extrema = find_peak_to_peak_extrema(times, positions)
+
+        result = detect_phase_ranges_with_auto_refinement(
+            times,
+            positions,
+            extrema,
+        )
+
+        self.assertTrue(result.events)
+        self.assertAlmostEqual(
+            result.events[0]["vibration_start_s"],
+            3.5,
+            delta=0.15,
+        )
+        self.assertAlmostEqual(
+            result.phase_ranges[0]["start_s"],
+            3.5,
+            delta=0.15,
+        )
+
     def test_auto_profile_detects_tagged_extrema_csv(self):
         project_root = Path(__file__).resolve().parents[1]
         with (project_root / "data" / "csv" / "0.4secondrun.csv").open(

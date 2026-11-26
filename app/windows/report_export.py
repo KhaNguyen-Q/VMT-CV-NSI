@@ -1,7 +1,9 @@
 """Export comparison reports from the CompareWindow data and controls."""
 
+import csv
 import json
 import os
+from inspect import signature
 from io import BytesIO
 
 import matplotlib
@@ -9,6 +11,7 @@ import matplotlib
 matplotlib.use("Agg")
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
+from matplotlib.patches import Patch
 import numpy as np
 import pandas as pd
 from PyQt5.QtWidgets import QDialog, QFileDialog, QMessageBox, QPushButton
@@ -17,10 +20,10 @@ from windows.NSIReportformat import format_value, save_report_json, save_reports
 from windows.range_csv_export import tagged_cycle_count
 from windows.report_metadata_dialog import ReportMetadataDialog
 try:
-    from analysis.comparator import compare_observed_value
+    from analysis.comparator import compare_observed_value, compare_range_export
     from analysis.loader import NUMERIC_COLUMNS
 except ModuleNotFoundError:
-    from app.analysis.comparator import compare_observed_value
+    from app.analysis.comparator import compare_observed_value, compare_range_export
     from app.analysis.loader import NUMERIC_COLUMNS
 
 _PX_TO_MM = 1.0 / 10.0
@@ -735,14 +738,110 @@ def _boxplot_inliers(values):
     return values[(values >= lower_fence) & (values <= upper_fence)]
 
 
-def _range_export_report_sections(window, selection):
+def _range_export_boxplot_figure(comparison_rows):
+    baseline_boxes = []
+    comparison_boxes = []
+    labels = []
+    positions = []
+    for row in comparison_rows:
+        if row["measurement"] != "Amplitude (mm)":
+            continue
+        baseline = row.get("baseline_statistics")
+        values = np.asarray(row["comparison_values"], dtype=float)
+        values = values[np.isfinite(values)]
+        if baseline is None or not values.size:
+            continue
+        try:
+            baseline_values = {
+                key: float(baseline[key])
+                for key in ("min", "q25", "median", "q75", "max")
+            }
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not np.isfinite(list(baseline_values.values())).all():
+            continue
+
+        context = [str(row["phase"]), str(row["vibration"])]
+        if row["device"] is not None:
+            context.insert(0, f"Device {row['device']}")
+        labels.append(" / ".join(context))
+        baseline_boxes.append(
+            {
+                "label": "Expected baseline",
+                "whislo": baseline_values["min"],
+                "q1": baseline_values["q25"],
+                "med": baseline_values["median"],
+                "q3": baseline_values["q75"],
+                "whishi": baseline_values["max"],
+                "fliers": [],
+            }
+        )
+        comparison_boxes.append(
+            {
+                "label": "Comparison",
+                "whislo": float(np.min(values)),
+                "q1": float(np.percentile(values, 25)),
+                "med": float(np.median(values)),
+                "q3": float(np.percentile(values, 75)),
+                "whishi": float(np.max(values)),
+                "fliers": [],
+            }
+        )
+        positions.append(len(labels) * 2)
+
+    if not baseline_boxes:
+        return None
+
+    figure = Figure(figsize=(8, max(2.5, len(labels) * 0.65)))
+    canvas = FigureCanvasAgg(figure)
+    axis = figure.add_subplot(1, 1, 1)
+    baseline_positions = [position - 0.35 for position in positions]
+    comparison_positions = [position + 0.35 for position in positions]
+    orientation = (
+        {"orientation": "horizontal"}
+        if "orientation" in signature(axis.bxp).parameters
+        else {"vert": False}
+    )
+    for stats, box_positions, color in (
+        (baseline_boxes, baseline_positions, "#4C78A8"),
+        (comparison_boxes, comparison_positions, "#F58518"),
+    ):
+        artists = axis.bxp(
+            stats,
+            positions=box_positions,
+            widths=0.55,
+            patch_artist=True,
+            manage_ticks=False,
+            showfliers=False,
+            **orientation,
+        )
+        for box in artists["boxes"]:
+            box.set_facecolor(color)
+            box.set_alpha(0.65)
+
+    axis.set_yticks(positions, labels)
+    axis.set_xlabel("Amplitude (mm)")
+    axis.set_title("Amplitude distribution: expected baseline vs comparison")
+    axis.grid(axis="x", alpha=0.25)
+    axis.legend(
+        handles=(
+            Patch(facecolor="#4C78A8", alpha=0.65, label="Expected baseline"),
+            Patch(facecolor="#F58518", alpha=0.65, label="Comparison"),
+        ),
+        loc="best",
+    )
+    figure.tight_layout()
+    output = BytesIO()
+    canvas.print_png(output)
+    figure.clear()
+    output.seek(0)
+    return output
+
+
+def _range_export_report_data(window, selection):
     comparison = window._comparison_range_df
-    profile = selection["treatment_profile"]
-    summary_rows = comparison[
-        comparison["Record Type"].astype(str).str.casefold()
-        == "phase summary"
-    ]
-    report_sections = []
+    summary_sections = []
+    detailed_sections = []
     suffixes = {
         "Duration (s)": " s",
         "High Peak (mm)": " mm",
@@ -752,80 +851,226 @@ def _range_export_report_sections(window, selection):
         "Cycle Period (s)": " s",
         "Frequency (Hz)": " Hz",
         "Cycle Count": "",
+        "Cycle Start (s)": " s",
+        "Cycle End (s)": " s",
     }
 
-    for (device, phase), phase_rows in summary_rows.groupby(
-        ["Device number", "Phase"],
-        dropna=False,
-        sort=False,
-    ):
-        rows = []
-        for measurement in NUMERIC_COLUMNS:
-            values = pd.to_numeric(
-                phase_rows[measurement], errors="coerce"
-            ).dropna()
-            if values.empty:
-                continue
-            observed = float(values.mean())
+    comparison_sections = compare_range_export(
+        selection["config_path"],
+        selection["treatment_profile"],
+        comparison,
+        selection["range_selection_method"],
+    )
+    statuses = []
+    csv_rows = []
+    output_summaries = []
+    for label, comparison_rows in comparison_sections:
+        detail_display_rows = []
+        by_measurement = {}
+        for result in comparison_rows:
+            measurement = result["measurement"]
             suffix = suffixes.get(measurement, "")
-            try:
-                result = compare_observed_value(
-                    selection["config_path"],
-                    profile,
-                    "phase_population",
-                    measurement,
-                    observed,
-                    phase=str(phase),
-                    record_type="Phase Summary",
-                    vibration="All Vibrations",
-                    range_selection_method=selection["range_selection_method"],
-                )
+            context = [
+                f"Phase {result['phase']}"
+                if str(result["phase"]).isdigit()
+                else str(result["phase"]),
+                str(result["vibration"]),
+                str(result["record_type"]),
+            ]
+            if result["device"] is not None:
+                context.insert(0, f"Device {result['device']}")
+            metric_label = " / ".join((*context, measurement))
+            if result["lower"] is None or result["upper"] is None:
+                baseline_value = result.get("error", "Acceptable range unavailable")
+                statuses.append("INCONCLUSIVE")
+            else:
                 baseline_value = (
                     f"[{result['lower']:.3f}, {result['upper']:.3f}]"
-                    f"{suffix}"
+                    f"{suffix} ({result.get('method', selection['range_selection_method'])})"
                 )
-                status = (
-                    "Within range"
-                    if result["status"] == "PASS"
-                    else "Outside range"
-                )
+                statuses.append(result["status"])
+            if result["observed"] is None:
+                comparison_value = f"Not available - {result['status']}"
+            else:
                 comparison_value = (
-                    f"{observed:.3f}{suffix} (n={len(values)}) — {status}"
+                    f"{result['observed']:.3f}{suffix} (n={result['count']})"
+                    f" - {result['status']}"
                 )
-            except (OSError, ValueError, KeyError, TypeError) as exc:
-                baseline_value = "Not available"
-                comparison_value = (
-                    f"{observed:.3f}{suffix} (n={len(values)}) — "
-                    f"reference unavailable: {exc}"
-                )
-            rows.append((measurement, baseline_value, comparison_value))
+            detail_display_rows.append(
+                (metric_label, baseline_value, comparison_value)
+            )
+            by_measurement.setdefault(measurement, []).append(result["status"])
+            csv_rows.append(
+                {
+                    "Analysis output": label,
+                    "Device number": result["device"] or "",
+                    "Phase": result["phase"],
+                    "Vibration": result["vibration"],
+                    "Record type": result["record_type"],
+                    "Measurement": measurement,
+                    "Values included (n)": result["count"],
+                    "Comparison mean": result["observed"],
+                    "Acceptable lower bound": result["lower"],
+                    "Acceptable upper bound": result["upper"],
+                    "Range method": result.get(
+                        "method", selection["range_selection_method"]
+                    ),
+                    "Result": result["status"],
+                    "Reference range CSV": result.get("range_csv", ""),
+                    "Range issue": result.get("error", ""),
+                }
+            )
 
-        report_sections.append(
+        plot = _range_export_boxplot_figure(comparison_rows)
+        notes = [
+            "Detailed phase, device, vibration, record-type, and measurement "
+            "results are included in the companion CSV."
+        ]
+        detailed_sections.append(
             (
-                f"{phase} — Device {device}",
-                rows,
-                [
-                    f"Comparison values are means across Phase Summary rows "
-                    f"for device {device} and the selected profile.",
-                    "Statistical boundaries are descriptive references; this "
-                    "report does not assign an overall pass/fail assessment.",
-                ],
-                None,
-                None,
+                f"{label} range output",
+                detail_display_rows,
+                notes,
+                plot,
+                plot,
                 None,
             )
         )
-    return report_sections
+
+        summary_rows = []
+        for measurement, measurement_statuses in by_measurement.items():
+            passed = measurement_statuses.count("PASS")
+            failed = measurement_statuses.count("FAIL")
+            inconclusive = measurement_statuses.count("INCONCLUSIVE")
+            summary_rows.append(
+                (
+                    measurement,
+                    str(len(measurement_statuses)),
+                    f"{passed} pass; {failed} fail; "
+                    f"{inconclusive} inconclusive",
+                )
+            )
+        measurement_statuses = [
+            status
+            for values in by_measurement.values()
+            for status in values
+        ]
+        output_status = (
+            "FAIL"
+            if "FAIL" in measurement_statuses
+            else "INCONCLUSIVE"
+            if "INCONCLUSIVE" in measurement_statuses
+            else "PASS"
+        )
+        output_summaries.append(
+            {
+                "analysis": label,
+                "result": output_status,
+                "checked": len(comparison_rows),
+                "pass": sum(
+                    values.count("PASS") for values in by_measurement.values()
+                ),
+                "fail": sum(
+                    values.count("FAIL") for values in by_measurement.values()
+                ),
+                "inconclusive": sum(
+                    values.count("INCONCLUSIVE")
+                    for values in by_measurement.values()
+                ),
+            }
+        )
+        summary_rows.append(
+            (
+                "Overall",
+                str(len(comparison_rows)),
+                f"{output_summaries[-1]['pass']} pass; "
+                f"{output_summaries[-1]['fail']} fail; "
+                f"{output_summaries[-1]['inconclusive']} inconclusive "
+                f"- {output_status}",
+            )
+        )
+        summary_sections.append(
+            (
+                f"{label} summary",
+                summary_rows,
+                notes,
+                plot,
+                plot,
+                None,
+            )
+        )
+
+    return summary_sections, detailed_sections, statuses, csv_rows, output_summaries
+
+
+def _range_export_report_sections(window, selection):
+    summary_sections, _details, statuses, _csv_rows, _summaries = (
+        _range_export_report_data(window, selection)
+    )
+    return summary_sections, statuses
+
+
+def _write_range_comparison_csv(path, rows, metadata):
+    detail_columns = [
+        "Analysis output",
+        "Device number",
+        "Phase",
+        "Vibration",
+        "Record type",
+        "Measurement",
+        "Values included (n)",
+        "Comparison mean",
+        "Acceptable lower bound",
+        "Acceptable upper bound",
+        "Range method",
+        "Result",
+        "Reference range CSV",
+        "Range issue",
+    ]
+    metadata_columns = {
+        key: f"Report {key}" if key in detail_columns else key
+        for key in metadata
+    }
+    columns = [*detail_columns, *metadata_columns.values()]
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    **row,
+                    **{
+                        metadata_columns[key]: value
+                        for key, value in metadata.items()
+                    },
+                }
+            )
 
 
 def _save_range_export_report(window, path, report_metadata, selection):
-    report_sections = _range_export_report_sections(window, selection)
+    try:
+        (
+            report_sections,
+            detailed_sections,
+            statuses,
+            csv_rows,
+            output_summaries,
+        ) = _range_export_report_data(window, selection)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        QMessageBox.warning(
+            window,
+            "Export report table",
+            f"Could not compare the exported ranges with the configured "
+            f"acceptable ranges:\n{exc}",
+        )
+        return
     if not any(section[1] for section in report_sections):
         QMessageBox.information(
             window,
             "Export report table",
-            "The selected treatment profile has no numeric Phase Summary "
-            "measurements to report.",
+            "The selected treatment profile has no numeric measurements "
+            "available for its enabled range outputs.",
         )
         return
 
@@ -836,16 +1081,37 @@ def _save_range_export_report(window, path, report_metadata, selection):
         os.path.basename(selection["comparison_csv"])
     )[0]
     client_path = os.path.splitext(path)[0] + "_CLIENT.docx"
+    csv_path = os.path.splitext(path)[0] + ".csv"
     json_path = os.path.splitext(path)[0] + ".json"
-    assessment = "INCONCLUSIVE"
-    assessment_reasons = [
-        "This report compares phase-summary means with descriptive statistical "
-        "ranges and does not apply the separate waveform-based assessment rules."
-    ]
+    if "FAIL" in statuses:
+        assessment = "FAIL"
+        assessment_reasons = []
+    elif not statuses or "INCONCLUSIVE" in statuses:
+        assessment = "INCONCLUSIVE"
+        assessment_reasons = []
+    else:
+        assessment = "PASS"
+        assessment_reasons = []
+    assessment_reasons.extend(
+        (
+            f"{summary['analysis']}: {summary['result']} - "
+            f"{summary['pass']} pass, {summary['fail']} fail, "
+            f"{summary['inconclusive']} inconclusive "
+            f"({summary['checked']} checked)."
+        )
+        for summary in output_summaries
+    )
+    conclusion = "; ".join(
+        f"{summary['analysis']}: {summary['result']} "
+        f"({summary['pass']} pass, {summary['fail']} fail, "
+        f"{summary['inconclusive']} inconclusive)"
+        for summary in output_summaries
+    )
     client_description = (
-        "This report presents descriptive comparisons against the selected "
-        "statistical reference ranges. It does not determine an overall "
-        "pass/fail assessment."
+        f"Overall assessment: {assessment}. {conclusion}. "
+        "The three tables summarize the phase-level, device-level, and "
+        "device-variability outputs. The companion CSV contains the detailed "
+        "measurement rows and their configured acceptable ranges."
     )
     try:
         save_reports(
@@ -859,6 +1125,8 @@ def _save_range_export_report(window, path, report_metadata, selection):
             client_description,
             report_sections,
             report_metadata,
+            range_comparison=True,
+            range_summary=True,
         )
         save_report_json(
             json_path,
@@ -869,8 +1137,10 @@ def _save_range_export_report(window, path, report_metadata, selection):
             assessment,
             assessment_reasons,
             client_description,
-            report_sections,
+            detailed_sections,
+            range_comparison=True,
         )
+        _write_range_comparison_csv(csv_path, csv_rows, report_metadata)
     except (OSError, ValueError) as exc:
         QMessageBox.warning(
             window,
@@ -881,7 +1151,8 @@ def _save_range_export_report(window, path, report_metadata, selection):
     QMessageBox.information(
         window,
         "Export report table",
-        f"Saved reports:\n{path}\n{client_path}\n{json_path}",
+        f"Saved reports and detailed comparison CSV:\n{path}\n{client_path}\n"
+        f"{csv_path}\n{json_path}",
     )
 
 

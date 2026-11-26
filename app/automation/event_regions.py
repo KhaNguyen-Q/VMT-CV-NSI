@@ -9,6 +9,8 @@ from .signal_features import (
     rolling_window_statistics,
 )
 
+_RELATIVE_ONSET_ENERGY_FRACTION = 0.1
+
 
 @dataclass(frozen=True)
 class CandidateRegion:
@@ -151,9 +153,40 @@ def detect_candidate_regions(
         return []
 
     active_bounds = [(group[0]["start_s"], group[-1]["end_s"]) for group in groups]
+    relative_onset_threshold = (
+        max(item["rms_noise_ratio"] for item in observations)
+        * _RELATIVE_ONSET_ENERGY_FRACTION
+    )
+    strong_onset = next(
+        (
+            item
+            for item in observations
+            if item["active"]
+            and item["rms_noise_ratio"]
+            >= max(energy_threshold, relative_onset_threshold)
+            and item["amplitude_noise_ratio"] >= amplitude_threshold
+        ),
+        None,
+    )
+    first_group_strong_onset = (
+        strong_onset["end_s"] - 2 * step * sample_interval
+        if strong_onset is not None
+        and strong_onset["start_s"] > times[0]
+        and active_bounds[0][0]
+        <= strong_onset["start_s"]
+        <= active_bounds[0][1]
+        else None
+    )
     region_bounds = []
     for index, (active_start, active_end) in enumerate(active_bounds):
-        start_s = float(times[0]) if index == 0 else region_bounds[-1][1]
+        if index == 0:
+            start_s = (
+                first_group_strong_onset
+                if first_group_strong_onset is not None
+                else float(times[0])
+            )
+        else:
+            start_s = region_bounds[-1][1]
         if index == len(active_bounds) - 1:
             end_s = float(times[-1])
         else:

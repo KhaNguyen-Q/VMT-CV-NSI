@@ -8,10 +8,12 @@ import pandas as pd
 
 try:
     from analysis.comparator_config import get_profile_config
+    from analysis.loader import CYCLE_DETAIL_NUMERIC_COLUMNS, NUMERIC_COLUMNS
     from analysis.loader import load_range_csvs
     from analysis.treatment_profiles import canonical_treatment_profile
 except ModuleNotFoundError:
     from app.analysis.comparator_config import get_profile_config
+    from app.analysis.loader import CYCLE_DETAIL_NUMERIC_COLUMNS, NUMERIC_COLUMNS
     from app.analysis.loader import load_range_csvs
     from app.analysis.treatment_profiles import canonical_treatment_profile
 
@@ -92,7 +94,7 @@ def resolve_range_paths(config_path, profile_config):
 
 def get_range_row(config_path, treatment_profile, analysis, measurement, phase=None,
                   record_type="Phase Summary", vibration="All Vibrations",
-                  range_selection_method=None):
+                  range_selection_method=None, device_number=None):
     """Return one baseline range row and its selected lower/upper bounds."""
     loaded, profile = get_profile_config(config_path, treatment_profile)
     if not profile.get("enabled_analyses", {}).get(analysis, False):
@@ -118,6 +120,10 @@ def get_range_row(config_path, treatment_profile, analysis, measurement, phase=N
         raise ValueError(
             f"Range CSV is missing required columns: {', '.join(missing)}"
         )
+    if analysis == "device_level" and "Device number" not in dataframe.columns:
+        raise ValueError(
+            'Device-level range CSV is missing required column "Device number".'
+        )
 
     profile_key = treatment_profile.strip().casefold()
     matching = dataframe[
@@ -131,6 +137,11 @@ def get_range_row(config_path, treatment_profile, analysis, measurement, phase=N
         matching = matching[
             matching["Phase"].astype(str).str.strip().str.casefold()
             == str(phase).strip().casefold()
+        ]
+    if device_number is not None and "Device number" in matching.columns:
+        matching = matching[
+            matching["Device number"].astype(str).str.strip().str.casefold()
+            == str(device_number).strip().casefold()
         ]
     matching = matching[
         matching["Record Type"].astype(str).str.strip().str.casefold()
@@ -180,7 +191,8 @@ def get_range_row(config_path, treatment_profile, analysis, measurement, phase=N
 
 def compare_observed_value(config_path, treatment_profile, analysis, measurement,
                            observed_value, phase=None, record_type="Phase Summary",
-                           vibration="All Vibrations", range_selection_method=None):
+                           vibration="All Vibrations", range_selection_method=None,
+                           device_number=None):
     """Compare one observed numeric value against a baseline range."""
     observed = pd.to_numeric(pd.Series([observed_value]), errors="coerce").iloc[0]
     if not math.isfinite(float(observed)):
@@ -199,6 +211,7 @@ def compare_observed_value(config_path, treatment_profile, analysis, measurement
         record_type=record_type,
         vibration=vibration,
         range_selection_method=range_selection_method,
+        device_number=device_number,
     )
     observed = float(observed)
     return {
@@ -208,4 +221,175 @@ def compare_observed_value(config_path, treatment_profile, analysis, measurement
         "upper": baseline["upper"],
         "method": baseline["method"],
         "range_csv": baseline["range_csv"],
+        "baseline_statistics": baseline["row"],
     }
+
+
+_ANALYSIS_LABELS = {
+    "phase_population": "Phase-level",
+    "device_level": "Device-level",
+    "device_variability": "Device-variability",
+}
+
+
+def compare_range_export(
+    config_path, treatment_profile, comparison, range_selection_method=None
+):
+    """Compare exported-range measurements against each enabled range output."""
+    loaded, profile = get_profile_config(config_path, treatment_profile)
+    profile_name = canonical_treatment_profile(treatment_profile)
+    comparison = comparison[
+        comparison["Treatment profile"].map(canonical_treatment_profile)
+        == profile_name
+    ].copy()
+    if comparison.empty:
+        raise ValueError(
+            f'No comparison rows found for treatment profile "{profile_name}".'
+        )
+
+    comparison["Record Type"] = comparison["Record Type"].astype(str).str.strip()
+    comparison["Phase"] = comparison["Phase"].astype(str).str.strip()
+    comparison["Vibration"] = comparison["Vibration"].astype(str).str.strip()
+    comparison["Device number"] = comparison["Device number"].astype(str).str.strip()
+    existing_all_vibrations = comparison[
+        comparison["Vibration"].str.casefold() == "all vibrations"
+    ]
+    vibration_rows = comparison[
+        comparison["Vibration"].str.casefold() != "all vibrations"
+    ]
+    if vibration_rows.empty:
+        comparison = existing_all_vibrations
+    else:
+        all_vibrations = vibration_rows.copy()
+        all_vibrations["Vibration"] = "All Vibrations"
+        comparison = pd.concat(
+            [vibration_rows, all_vibrations], ignore_index=True
+        )
+
+    report_sections = []
+    for analysis, label in _ANALYSIS_LABELS.items():
+        if not profile.get("enabled_analyses", {}).get(analysis, False):
+            continue
+
+        rows = []
+        record_types = (
+            comparison["Record Type"].dropna().drop_duplicates().tolist()
+        )
+        for record_type in record_types:
+            record_rows = comparison[
+                comparison["Record Type"].str.casefold()
+                == record_type.casefold()
+            ]
+            measurements = (
+                NUMERIC_COLUMNS
+                if record_type.casefold() == "phase summary"
+                else CYCLE_DETAIL_NUMERIC_COLUMNS
+                if record_type.casefold() == "cycle detail"
+                else ()
+            )
+            for measurement in measurements:
+                if measurement not in record_rows:
+                    continue
+                values = pd.to_numeric(record_rows[measurement], errors="coerce")
+                valid = record_rows.loc[values.notna()].copy()
+                valid[measurement] = values[values.notna()].astype(float)
+                if valid.empty:
+                    continue
+
+                if analysis == "phase_population":
+                    dimensions = ["Phase", "Vibration"]
+                    grouped = valid.groupby(dimensions, dropna=False, sort=False)
+                    aggregates = (
+                        (
+                            keys,
+                            float(group[measurement].mean()),
+                            len(group),
+                            None,
+                            group[measurement].to_numpy(dtype=float),
+                        )
+                        for keys, group in grouped
+                    )
+                elif analysis == "device_level":
+                    dimensions = ["Device number", "Phase", "Vibration"]
+                    grouped = valid.groupby(dimensions, dropna=False, sort=False)
+                    aggregates = (
+                        (
+                            keys[1:],
+                            float(group[measurement].mean()),
+                            len(group),
+                            keys[0],
+                            group[measurement].to_numpy(dtype=float),
+                        )
+                        for keys, group in grouped
+                    )
+                else:
+                    per_device = (
+                        valid.groupby(
+                            ["Device number", "Phase", "Vibration"],
+                            dropna=False,
+                            sort=False,
+                        )[measurement]
+                        .mean()
+                        .reset_index()
+                    )
+                    grouped = per_device.groupby(
+                        ["Phase", "Vibration"], dropna=False, sort=False
+                    )
+                    aggregates = (
+                        (
+                            keys,
+                            float(group[measurement].mean()),
+                            len(group),
+                            None,
+                            group[measurement].to_numpy(dtype=float),
+                        )
+                        for keys, group in grouped
+                    )
+
+                for keys, observed, count, device, comparison_values in aggregates:
+                    phase, vibration = keys
+                    try:
+                        result = compare_observed_value(
+                            loaded["path"],
+                            profile_name,
+                            analysis,
+                            measurement,
+                            observed,
+                            phase=phase,
+                            record_type=record_type,
+                            vibration=vibration,
+                            range_selection_method=range_selection_method,
+                            device_number=device,
+                        )
+                    except (OSError, ValueError, KeyError, TypeError) as exc:
+                        result = {
+                            "status": "INCONCLUSIVE",
+                            "observed": observed,
+                            "lower": None,
+                            "upper": None,
+                            "error": str(exc),
+                        }
+                    rows.append(
+                        {
+                            "analysis": analysis,
+                            "analysis_label": label,
+                            "device": device,
+                            "phase": phase,
+                            "vibration": vibration,
+                            "record_type": record_type,
+                            "measurement": measurement,
+                            "count": count,
+                            "comparison_values": comparison_values,
+                            **result,
+                        }
+                    )
+
+        if rows:
+            report_sections.append((label, rows))
+
+    if not report_sections:
+        raise ValueError(
+            "The selected profile has no enabled range outputs with "
+            "comparable numeric measurements."
+        )
+    return report_sections

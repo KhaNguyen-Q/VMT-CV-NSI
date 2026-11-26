@@ -119,11 +119,18 @@ def detect_phase_ranges(
     detected_events = []
     candidate_diagnostics = []
     for region_index, region in enumerate(candidate_regions, start=1):
-        region_cycles = [
-            cycle
-            for cycle in cycles
-            if cycle.end_s > region.start_s and cycle.start_s < region.end_s
-        ]
+        if region_index == 1 and region.start_s > times[0]:
+            region_cycles = [
+                cycle
+                for cycle in cycles
+                if region.start_s <= cycle.start_s < region.end_s
+            ]
+        else:
+            region_cycles = [
+                cycle
+                for cycle in cycles
+                if cycle.end_s > region.start_s and cycle.start_s < region.end_s
+            ]
         region_quiet_intervals = [
             interval
             for interval in quiet_intervals

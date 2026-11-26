@@ -2,7 +2,6 @@
 
 import json
 import os
-from io import BytesIO
 
 from docx import Document
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
@@ -56,23 +55,37 @@ def _add_user_metadata(document, metadata):
 
 
 def _add_assessment_summary(
-    document, assessment, assessment_reasons, client_facing, client_description
+    document,
+    assessment,
+    assessment_reasons,
+    client_facing,
+    client_description,
+    range_comparison=False,
 ):
     if client_facing:
         document.add_heading("Quality assurance summary", level=2)
         summary_status = document.add_paragraph()
         summary_status.add_run(f"Assessment: {assessment}").bold = True
         document.add_paragraph(client_description)
-        document.add_paragraph(
-            "Phase 1 and Phase 2 measurements determine the "
-            "assessment. Phase 3 results are shown for information "
-            "only. See the appendix for how measurements and the "
-            "assessment are calculated."
-        )
+        if range_comparison:
+            document.add_paragraph(
+                "The assessment checks the phase-level, device-level, and "
+                "device-variability comparison values against the selected "
+                "acceptable ranges."
+            )
+        else:
+            document.add_paragraph(
+                "Phase 1 and Phase 2 measurements determine the "
+                "assessment. Phase 3 results are shown for information "
+                "only. See the appendix for how measurements and the "
+                "assessment are calculated."
+            )
         return
 
     assessment_line = document.add_paragraph()
-    assessment_line.add_run("Device assessment: ").bold = True
+    assessment_line.add_run(
+        "Comparison assessment: " if range_comparison else "Device assessment: "
+    ).bold = True
     assessment_line.add_run(assessment)
     summary_heading = (
         "Reason for failure"
@@ -87,15 +100,28 @@ def _add_assessment_summary(
     else:
         for reason in assessment_reasons:
             document.add_paragraph(reason, style="List Bullet")
-    document.add_paragraph(
-        "Assessment uses Phase 1 and Phase 2 only. The selected "
-        "baseline is the reference; Phase 3 and correlation "
-        "scores are informational. The appendix explains the "
-        "calculations and pass, review, and fail rules."
-    )
+    if range_comparison:
+        document.add_paragraph(
+            "Each reported comparison mean is checked against the selected "
+            "acceptable boundary from the corresponding phase-level, "
+            "device-level, or device-variability range output."
+        )
+    else:
+        document.add_paragraph(
+            "Assessment uses Phase 1 and Phase 2 only. The selected "
+            "baseline is the reference; Phase 3 and correlation "
+            "scores are informational. The appendix explains the "
+            "calculations and pass, review, and fail rules."
+        )
 
 
-def _add_phase_sections(document, report_sections, client_facing):
+def _add_phase_sections(
+    document,
+    report_sections,
+    client_facing,
+    range_comparison=False,
+    range_summary=False,
+):
     for label, rows, notes, internal_plot, client_plot, boxplot in report_sections:
         phase_plot = client_plot if client_facing else internal_plot
         heading = document.add_heading(label, level=2)
@@ -105,7 +131,14 @@ def _add_phase_sections(document, report_sections, client_facing):
         table.alignment = WD_TABLE_ALIGNMENT.CENTER
         table.autofit = True
         header_cells = table.rows[0].cells
-        for cell, text in zip(header_cells, ("Measurement", "Baseline", "Comparison")):
+        headers = (
+            ("Measurement", "Values checked", "Outcome summary")
+            if range_summary
+            else ("Measurement", "Acceptable range", "Comparison result")
+            if range_comparison
+            else ("Measurement", "Baseline", "Comparison")
+        )
+        for cell, text in zip(header_cells, headers):
             cell.text = text
             cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
             for run in cell.paragraphs[0].runs:
@@ -125,15 +158,19 @@ def _add_phase_sections(document, report_sections, client_facing):
                 f"{label} waveform comparison (selected time ranges)"
             )
             caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            document.add_picture(BytesIO(phase_plot), width=Inches(6.0))
+            document.add_picture(phase_plot, width=Inches(6.0))
 
         if boxplot is not None:
-            caption = document.add_paragraph(
-                f"{label} measurement distributions. Circles mark "
+            caption_text = (
+                f"{label} amplitude distributions: expected baseline vs "
+                "comparison"
+                if range_comparison
+                else f"{label} measurement distributions. Circles mark "
                 "boxplot outliers (1.5×IQR)"
             )
+            caption = document.add_paragraph(caption_text)
             caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            document.add_picture(BytesIO(boxplot), width=Inches(6.0))
+            document.add_picture(boxplot, width=Inches(6.0))
 
         if notes:
             notes_paragraph = document.add_paragraph()
@@ -141,7 +178,7 @@ def _add_phase_sections(document, report_sections, client_facing):
             notes_paragraph.add_run(" ".join(notes))
 
 
-def _add_assessment_criteria(document):
+def _add_assessment_criteria(document, range_comparison=False):
     appendix = document.add_heading(
         "Appendix: Measurement and Assessment Method",
         level=1,
@@ -162,7 +199,14 @@ def _add_assessment_criteria(document):
         shading = OxmlElement("w:shd")
         shading.set(qn("w:fill"), "F2F2F2")
         cell._tc.get_or_add_tcPr().append(shading)
-    for status, rule in (
+    criteria_rows = (
+        (
+            ("FAIL", "At least one comparison value is outside its configured acceptable range."),
+            ("PASS", "Every reported comparison value is within its configured acceptable range."),
+            ("INCONCLUSIVE", "One or more values could not be matched to an acceptable range."),
+        )
+        if range_comparison
+        else (
         (
             "FAIL",
             "Any Phase 2 cycle-count difference is 20 cycles or "
@@ -187,7 +231,9 @@ def _add_assessment_criteria(document):
             "Required data is sufficient; no FAIL or REVIEW "
             "criterion is triggered.",
         ),
-    ):
+        )
+    )
+    for status, rule in criteria_rows:
         cells = criteria.add_row().cells
         cells[0].text = status
         cells[1].text = rule
@@ -226,7 +272,30 @@ def _add_method_appendix_link(document):
 
 
 def _build_excel_table(metadata, report_sections):
-    columns = ["Phase", "Measurement", "Baseline", "Comparison", *metadata]
+    return _build_excel_table_for_section(metadata, report_sections, "Phase")
+
+
+def _build_excel_table_for_section(
+    metadata,
+    report_sections,
+    section_column,
+    range_comparison=False,
+    range_summary=False,
+):
+    comparison_columns = (
+        ("Values checked", "Outcome summary")
+        if range_summary
+        else
+        ("Acceptable range", "Comparison result")
+        if range_comparison
+        else ("Baseline", "Comparison")
+    )
+    columns = [
+        section_column,
+        "Measurement",
+        *comparison_columns,
+        *metadata,
+    ]
     values = [
         [label, measurement, baseline, comparison, *metadata.values()]
         for label, rows, *_ in report_sections
@@ -249,6 +318,8 @@ def _add_report_content(
     report_sections,
     metadata,
     client_facing,
+    range_comparison=False,
+    range_summary=False,
 ):
     title = document.add_heading(
         "NSI Client Report" if client_facing else "NSI Report",
@@ -263,10 +334,19 @@ def _add_report_content(
         assessment_reasons,
         client_facing,
         client_description,
+        range_comparison,
     )
-    _add_phase_sections(document, report_sections, client_facing)
-    _add_assessment_criteria(document)
-    _add_method_appendix_link(document)
+    _add_phase_sections(
+        document,
+        report_sections,
+        client_facing,
+        range_comparison,
+        range_summary,
+    )
+    if not range_summary:
+        _add_assessment_criteria(document, range_comparison)
+    if not range_comparison:
+        _add_method_appendix_link(document)
 
     if client_facing:
         closing = document.add_paragraph(
@@ -288,6 +368,8 @@ def save_reports(
     client_description,
     report_sections,
     metadata,
+    range_comparison=False,
+    range_summary=False,
 ):
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
@@ -305,6 +387,8 @@ def save_reports(
         report_sections,
         metadata,
         client_facing=False,
+        range_comparison=range_comparison,
+        range_summary=range_summary,
     )
     client_document = Document()
     _add_report_content(
@@ -318,6 +402,8 @@ def save_reports(
         report_sections,
         metadata,
         client_facing=True,
+        range_comparison=range_comparison,
+        range_summary=range_summary,
     )
     internal_document.save(path)
     client_document.save(client_path)
@@ -333,6 +419,8 @@ def save_report_json(
     assessment_reasons,
     client_description,
     report_sections,
+    range_comparison=False,
+    range_summary=False,
 ):
     payload = {
         "report": "NSI Comparison Report",
@@ -345,11 +433,24 @@ def save_report_json(
             "reasons": assessment_reasons,
             "client_summary": client_description,
         },
-        "excel_table": _build_excel_table(metadata, report_sections),
+        "excel_table": _build_excel_table_for_section(
+            metadata,
+            report_sections,
+            "Analysis" if range_comparison else "Phase",
+            range_comparison,
+            range_summary,
+        ),
         "sections": [
             {
-                "phase": label,
-                "columns": ["Measurement", "Baseline", "Comparison"],
+                "analysis" if range_comparison else "phase": label,
+                "columns": (
+                    ["Measurement", "Values checked", "Outcome summary"]
+                    if range_summary
+                    else
+                    ["Measurement", "Acceptable range", "Comparison result"]
+                    if range_comparison
+                    else ["Measurement", "Baseline", "Comparison"]
+                ),
                 "rows": [
                     {
                         "measurement": measurement,
