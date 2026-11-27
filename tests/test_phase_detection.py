@@ -127,7 +127,7 @@ class PhaseDetectionTests(unittest.TestCase):
                 profiles=profiles,
             )
 
-        self.assertEqual(detector.call_count, 2)
+        self.assertGreaterEqual(detector.call_count, 2)
         self.assertEqual(
             result.profile_metadata["auto_refinement"]["tagged_phase1_counts"],
             [11],
@@ -137,6 +137,264 @@ class PhaseDetectionTests(unittest.TestCase):
         )
         self.assertEqual(
             result.profile_metadata["auto_refinement"]["status"], "target_met"
+        )
+
+    def test_auto_refinement_trials_other_configured_profiles(self):
+        profiles = [
+            TreatmentProfile.from_dict(
+                {**item.to_dict(), "name": "Main"}
+            )
+            if item.name == "0.7 mm"
+            else item
+            for item in default_treatment_profiles()
+        ]
+        auto_profile = next(
+            profile for profile in profiles if profile.name == "Auto Detect"
+        )
+        extrema = [
+            {"time_s": float(index), "label": label}
+            for index in range(1, 12)
+            for label in ("top", "bottom")
+        ]
+
+        def fake_detect(
+            times,
+            positions,
+            config=None,
+            profile=None,
+            profiles=None,
+            method="FSM",
+        ):
+            resolved = next(
+                item
+                for item in profiles
+                if item.expected_amplitude_category == "1.1 mm"
+            )
+            target_met = resolved.name == "Main"
+            phase1_ends = (
+                [11.5, 11.5] if target_met else [10.5, 9.5]
+            )
+            return PhaseDetectionResult(
+                phase_ranges=[
+                    {
+                        "label": "Phase 1",
+                        "start_s": 0.0,
+                        "end_s": end_s,
+                    }
+                    for end_s in phase1_ends
+                ],
+                events=[{"event": 1}, {"event": 2}],
+                candidate_regions=[],
+                noise_profile={},
+                cycle_count=0,
+                diagnostics=[],
+                profile_metadata={
+                    "selected_profile": "Auto Detect",
+                    "resolved_profile": resolved.name,
+                    "expected_amplitude_category": "1.1 mm",
+                    "parameters_used": {},
+                    "detection_confidence": 0.8,
+                },
+            )
+
+        with patch(
+            "app.automation.phase_detector.detect_phase_ranges",
+            side_effect=fake_detect,
+        ) as detector:
+            result = detect_phase_ranges_with_auto_refinement(
+                np.asarray([0.0, 1.0]),
+                np.asarray([0.0, 1.0]),
+                extrema,
+                profile=auto_profile,
+                profiles=profiles,
+            )
+
+        self.assertGreater(detector.call_count, 1)
+        self.assertEqual(result.profile_metadata["resolved_profile"], "Main")
+        self.assertEqual(
+            result.profile_metadata["auto_refinement"]["tagged_phase1_counts"],
+            [11, 11],
+        )
+        self.assertTrue(
+            result.profile_metadata["auto_refinement"]["all_phase1_have_11"]
+        )
+
+    def test_auto_refinement_aligns_boundaries_to_stable_tagged_extrema(self):
+        profiles = default_treatment_profiles()
+        auto_profile = next(
+            profile for profile in profiles if profile.name == "Auto Detect"
+        )
+        period = 1.0 / 15.0
+        extrema = []
+        for index in range(11):
+            bottom_time = 0.5 + index * period
+            extrema.extend(
+                [
+                    {
+                        "time_s": bottom_time,
+                        "position_px": -5.0,
+                        "label": "bottom",
+                    },
+                    {
+                        "time_s": bottom_time + period / 2.0,
+                        "position_px": 5.0,
+                        "label": "top",
+                    },
+                ]
+            )
+        phase1_start = extrema[1]["time_s"]
+        phase1_end = extrema[-1]["time_s"] - 1.0 / 240.0
+
+        def fake_detect(
+            times,
+            positions,
+            config=None,
+            profile=None,
+            profiles=None,
+            method="FSM",
+        ):
+            resolved = next(item for item in profiles if item.name == "0.4 mm")
+            return PhaseDetectionResult(
+                phase_ranges=[
+                    {"label": "Phase 1", "start_s": phase1_start, "end_s": phase1_end},
+                    {"label": "Phase 2", "start_s": phase1_end, "end_s": 1.3},
+                    {"label": "Phase 3", "start_s": 1.3, "end_s": 1.6},
+                ],
+                events=[
+                    {
+                        "event": 1,
+                        "vibration_start_s": phase1_start,
+                        "phase2_start_s": phase1_end,
+                        "vibration_end_s": phase1_end,
+                        "phase3_end_s": 1.6,
+                        "total_duration_s": phase1_end - phase1_start,
+                        "phase1_frequency_hz": 15.0,
+                        "phase1_baseline_frequency_hz": 15.0,
+                    }
+                ],
+                candidate_regions=[],
+                noise_profile={},
+                cycle_count=0,
+                diagnostics=[],
+                profile_metadata={
+                    "selected_profile": "Auto Detect",
+                    "resolved_profile": resolved.name,
+                    "expected_amplitude_category": "0.4 mm",
+                    "parameters_used": {},
+                    "detection_confidence": 0.8,
+                },
+            )
+
+        sample_times = np.arange(0.0, 1.8, 1.0 / 240.0)
+        with patch(
+            "app.automation.phase_detector.detect_phase_ranges",
+            side_effect=fake_detect,
+        ) as detector:
+            result = detect_phase_ranges_with_auto_refinement(
+                sample_times,
+                np.zeros(sample_times.size),
+                extrema,
+                profile=auto_profile,
+                profiles=profiles,
+            )
+
+        self.assertEqual(detector.call_count, 1)
+        self.assertEqual(
+            result.profile_metadata["auto_refinement"]["tagged_phase1_counts"],
+            [11],
+        )
+        phase1, phase2 = result.phase_ranges[:2]
+        self.assertAlmostEqual(phase1["start_s"], 0.5)
+        self.assertAlmostEqual(phase1["end_s"], extrema[-1]["time_s"])
+        self.assertEqual(phase2["start_s"], phase1["end_s"])
+        self.assertTrue(
+            result.profile_metadata["phase1_boundary_refinement"]["events"][0][
+                "adjusted"
+            ]
+        )
+
+    def test_auto_refinement_returns_best_candidate_at_time_limit(self):
+        profiles = default_treatment_profiles()
+        auto_profile = next(
+            profile for profile in profiles if profile.name == "Auto Detect"
+        )
+        extrema = [
+            {"time_s": float(index), "label": label}
+            for index in range(1, 12)
+            for label in ("top", "bottom")
+        ]
+        detect_calls = 0
+
+        def fake_detect(
+            times,
+            positions,
+            config=None,
+            profile=None,
+            profiles=None,
+            method="FSM",
+        ):
+            nonlocal detect_calls
+            detect_calls += 1
+            resolved = next(
+                item
+                for item in profiles
+                if item.expected_amplitude_category == "1.1 mm"
+            )
+            phase1_ends = (
+                [10.5, 9.5] if detect_calls == 1 else [11.5, 9.5]
+            )
+            return PhaseDetectionResult(
+                phase_ranges=[
+                    {
+                        "label": "Phase 1",
+                        "start_s": 0.0,
+                        "end_s": end_s,
+                    }
+                    for end_s in phase1_ends
+                ],
+                events=[{"event": 1}, {"event": 2}],
+                candidate_regions=[],
+                noise_profile={},
+                cycle_count=0,
+                diagnostics=[],
+                profile_metadata={
+                    "selected_profile": "Auto Detect",
+                    "resolved_profile": resolved.name,
+                    "expected_amplitude_category": "1.1 mm",
+                    "parameters_used": {},
+                    "detection_confidence": 0.8,
+                },
+            )
+
+        with patch(
+            "app.automation.phase_detector.detect_phase_ranges",
+            side_effect=fake_detect,
+        ) as detector:
+            with patch(
+                "app.automation.phase_detector._AUTO_REFINEMENT_MAX_SECONDS",
+                6.0,
+            ):
+                with patch(
+                    "app.automation.phase_detector.time.monotonic",
+                    side_effect=lambda: (
+                        100.0 if detector.call_count <= 1 else 106.0
+                    ),
+                ):
+                    result = detect_phase_ranges_with_auto_refinement(
+                        np.asarray([0.0, 1.0]),
+                        np.asarray([0.0, 1.0]),
+                        extrema,
+                        profile=auto_profile,
+                        profiles=profiles,
+                    )
+
+        self.assertEqual(detector.call_count, 2)
+        self.assertEqual(
+            result.profile_metadata["auto_refinement"]["tagged_phase1_counts"],
+            [11, 9],
+        )
+        self.assertTrue(
+            result.profile_metadata["auto_refinement"]["time_limit_reached"]
         )
 
     def test_auto_refinement_improves_tagged_cycle_score_on_sample(self):
